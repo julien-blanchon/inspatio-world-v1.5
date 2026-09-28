@@ -56,6 +56,8 @@ logger = logging.getLogger("inspatio-space")
 REPO_ID = os.environ.get("INSPATIO_REPO", "blanchon/inspatio-world-v1.5")
 GPU_SIZE = os.environ.get("INSPATIO_GPU_SIZE", "xlarge")
 SESSION_SECONDS = 90  # upper bound of a session's GPU time
+DEFAULT_SESSION_SECONDS = 45  # (45 + margin) x 2 (xlarge) fits the 120 s anonymous daily quota
+SESSION_MARGIN_SECONDS = 10  # scene loading, prompt encoding and the eager first block
 SECONDS_ARG = 6  # position of `seconds` in run_session's arguments
 MAX_LEAD_SECONDS = 1.0  # generation may run this far ahead of playback before it waits
 MAX_UPLOAD_FRAMES = 180
@@ -158,7 +160,7 @@ def select_example(event: gr.SelectData) -> tuple[str, np.ndarray, str]:
 def session_duration(*args: object) -> int:
     """GPU time to reserve: the requested session length plus loading (same args as run_session)."""
 
-    return int(float(args[SECONDS_ARG])) + 30  # pyright: ignore[reportArgumentType]
+    return int(float(args[SECONDS_ARG])) + SESSION_MARGIN_SECONDS  # pyright: ignore[reportArgumentType]
 
 
 @spaces.GPU(duration=session_duration, size=GPU_SIZE)  # pyright: ignore[reportArgumentType]
@@ -326,7 +328,11 @@ with gr.Blocks(title="InSpatio-World 1.5") as demo:
                 )
                 speed = gr.Slider(0.25, 3.0, value=1.0, step=0.25, label="Movement speed")
                 seconds = gr.Slider(
-                    15, SESSION_SECONDS, value=60, step=5, label="Session length (s)"
+                    15,
+                    SESSION_SECONDS,
+                    value=DEFAULT_SESSION_SECONDS,
+                    step=5,
+                    label="Session length (s)",
                 )
                 seed = gr.Number(0, label="Seed", precision=0)
 
