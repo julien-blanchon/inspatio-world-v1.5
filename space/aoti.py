@@ -35,9 +35,6 @@ logger = logging.getLogger(__name__)
 STEADY_CONTEXT_FRAMES = 6
 LATENT_HEIGHT, LATENT_WIDTH = 60, 104
 STEADY_CONTEXT_TOKENS = STEADY_CONTEXT_FRAMES * (LATENT_HEIGHT // 2) * (LATENT_WIDTH // 2)
-# Pick Triton configs by heuristics instead of benchmarking them while compiling: the
-# benchmark's CUDA event timing fails inside ZeroGPU's compile call
-INDUCTOR_CONFIGS = {"triton.autotune_at_compile_time": False}
 
 
 class Prefill(nn.Module):
@@ -93,13 +90,32 @@ def compile_graphs(world: WorldModel) -> dict[str, Any]:
         "prefill": Prefill(world.dit),
         "denoise": Denoise(world.dit),
     }
+    _synchronized_event_timing()
     compiled = {}
     for name, args in example_inputs(world).items():
         with torch.no_grad():
             exported = torch.export.export(modules[name], args=args)
-        compiled[name] = spaces.aoti_compile(exported, INDUCTOR_CONFIGS)
+        compiled[name] = spaces.aoti_compile(exported)
         logger.info("compiled %s", name)
     return compiled
+
+
+def _synchronized_event_timing() -> None:
+    """Make CUDA event timing wait for both events.
+
+    Inductor times candidate kernels with CUDA events while compiling; inside a ZeroGPU call
+    the events can still be pending when their elapsed time is read ("Both events must be
+    completed before calculating elapsed time"), which aborts the compilation.
+    """
+
+    elapsed_time = torch.cuda.Event.elapsed_time
+
+    def synchronized(self: torch.cuda.Event, end_event: torch.cuda.Event) -> float:
+        self.synchronize()
+        end_event.synchronize()
+        return elapsed_time(self, end_event)
+
+    torch.cuda.Event.elapsed_time = synchronized  # type: ignore[method-assign]
 
 
 def install(world: WorldModel, compiled: dict[str, Any]) -> None:
