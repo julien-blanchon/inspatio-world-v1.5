@@ -4,12 +4,14 @@ ZeroGPU runs every `@spaces.GPU` call in a fresh worker, so `torch.compile`'s JI
 lost after each call; ahead-of-time (AoTI) compilation produces a shared library once at startup
 that every later call reuses (https://huggingface.co/blog/zerogpu-aoti).
 
-Only the shapes that repeat every block are compiled; the first block of a session (3-frame
-context, 1-frame encoder chunk) keeps the eager path:
+Only the DiT shapes that repeat every block are compiled; the first block of a session
+(3-frame context) keeps the eager path:
 
     prefill   DiT over the 6-frame context (source block + previous prediction)
     denoise   DiT denoising step of a 3-frame block against the 6-frame cache
-    encode    VAE encoder over one steady-state 4-frame chunk, cache tensors in and out
+
+The VAE encoder stays eager: its AoT graph (cache tails in and out) returned corrupted tails
+(measured: the generation stops following the camera), so it was dropped.
 
 Each graph is exported from a thin wrapper module, compiled with `spaces.aoti_compile`, and
 dispatched by shape from the world model's methods (`install`). If compilation fails the Space
@@ -26,14 +28,16 @@ import torch
 from torch import Tensor, nn
 
 from inspatio_world import WorldModel
-from inspatio_world.wan import CausalCache, CausalWanDiT, WanVAE
+from inspatio_world.wan import CausalWanDiT
 
 logger = logging.getLogger(__name__)
 
 STEADY_CONTEXT_FRAMES = 6
 LATENT_HEIGHT, LATENT_WIDTH = 60, 104
-FRAMES_PER_CHUNK = 4
-STEADY_TAIL_FRAMES = 2  # encoder cache tails hold 2 frames from the third chunk on
+STEADY_CONTEXT_TOKENS = STEADY_CONTEXT_FRAMES * (LATENT_HEIGHT // 2) * (LATENT_WIDTH // 2)
+# Pick Triton configs by heuristics instead of benchmarking them while compiling: the
+# benchmark's CUDA event timing fails inside ZeroGPU's compile call
+INDUCTOR_CONFIGS = {"triton.autotune_at_compile_time": False}
 
 
 class Prefill(nn.Module):
@@ -61,19 +65,8 @@ class Denoise(nn.Module):
         return self.dit.denoise(noisy, condition, timesteps, context_kv, text_kv)
 
 
-class EncodeChunk(nn.Module):
-    def __init__(self, vae: WanVAE) -> None:
-        super().__init__()
-        self.vae = vae
-
-    def forward(self, frames: Tensor, slots: list[Tensor]) -> tuple[Tensor, list[Tensor]]:
-        cache = CausalCache(list(slots))
-        latent = self.vae.encode_chunk(frames, cache)
-        return latent, [slot for slot in cache.slots if slot is not None]
-
-
 def example_inputs(world: WorldModel) -> dict[str, tuple[Any, ...]]:
-    """Real-shaped inputs of the three steady-state calls (random values)."""
+    """Real-shaped inputs of the two steady-state DiT calls (random values)."""
 
     device, dtype = world.device, world.dit.dtype
     # Export traces outside inference mode: inputs must be ordinary tensors
@@ -87,35 +80,24 @@ def example_inputs(world: WorldModel) -> dict[str, tuple[Any, ...]]:
     condition = torch.randn(1, 20, 3, LATENT_HEIGHT, LATENT_WIDTH, device=device, dtype=dtype)
     timesteps = torch.full((1,), 937.5, device=device)
 
-    # The cache tails reach their steady length (2 frames) after the first two chunks
-    frames = (
-        torch.rand(1, 3, 1 + 2 * FRAMES_PER_CHUNK, 480, 832, device=device, dtype=dtype) * 2 - 1
-    )
-    cache = CausalCache()
-    with torch.no_grad():
-        world.vae.encode(frames[:, :, : 1 + FRAMES_PER_CHUNK], cache)
-    slots = [slot for slot in cache.slots if slot is not None]
-    assert len(slots) == len(cache.slots), "the encoder writes a tensor to every cache slot"
     return {
         "prefill": (context, text_kv),
         "denoise": (noisy, condition, timesteps, context_kv, text_kv),
-        "encode": (frames[:, :, 1 + FRAMES_PER_CHUNK :], slots),
     }
 
 
 def compile_graphs(world: WorldModel) -> dict[str, Any]:
-    """Export and AoT-compile the three graphs (call inside `@spaces.GPU`)."""
+    """Export and AoT-compile both graphs (call inside `@spaces.GPU`)."""
 
     modules = {
         "prefill": Prefill(world.dit),
         "denoise": Denoise(world.dit),
-        "encode": EncodeChunk(world.vae),
     }
     compiled = {}
     for name, args in example_inputs(world).items():
         with torch.no_grad():
             exported = torch.export.export(modules[name], args=args)
-        compiled[name] = spaces.aoti_compile(exported)
+        compiled[name] = spaces.aoti_compile(exported, INDUCTOR_CONFIGS)
         logger.info("compiled %s", name)
     return compiled
 
@@ -123,8 +105,8 @@ def compile_graphs(world: WorldModel) -> dict[str, Any]:
 def install(world: WorldModel, compiled: dict[str, Any]) -> None:
     """Route the steady-state shapes to the compiled graphs, everything else to eager code."""
 
-    dit, vae = world.dit, world.vae
-    eager_prefill, eager_denoise, eager_encode = dit.prefill, dit.denoise, vae.encode_chunk
+    dit = world.dit
+    eager_prefill, eager_denoise = dit.prefill, dit.denoise
 
     def prefill(latents: Tensor, text_kv: Tensor) -> Tensor:
         if latents.shape[2] == STEADY_CONTEXT_FRAMES:
@@ -134,19 +116,8 @@ def install(world: WorldModel, compiled: dict[str, Any]) -> None:
     def denoise(
         noisy: Tensor, condition: Tensor, timesteps: Tensor, context_kv: Tensor, text_kv: Tensor
     ) -> Tensor:
-        if context_kv.shape[3] == STEADY_CONTEXT_FRAMES * (LATENT_HEIGHT // 2) * (
-            LATENT_WIDTH // 2
-        ):
+        if context_kv.shape[3] == STEADY_CONTEXT_TOKENS:
             return compiled["denoise"](noisy, condition, timesteps, context_kv, text_kv)
         return eager_denoise(noisy, condition, timesteps, context_kv, text_kv)
 
-    def encode_chunk(frames: Tensor, cache: CausalCache) -> Tensor:
-        first = cache.slots[0] if cache.slots else None
-        steady = first is not None and first.shape[2] == STEADY_TAIL_FRAMES
-        if frames.shape[2] != FRAMES_PER_CHUNK or not steady:
-            return eager_encode(frames, cache)
-        latent, slots = compiled["encode"](frames, cache.slots)
-        cache.slots[:] = slots
-        return latent
-
-    dit.prefill, dit.denoise, vae.encode_chunk = prefill, denoise, encode_chunk  # type: ignore[method-assign]
+    dit.prefill, dit.denoise = prefill, denoise  # type: ignore[method-assign]

@@ -92,7 +92,8 @@ def _state_file(browser: str, name: str) -> Path:
 
 def write_state(browser: str, name: str, value: dict[str, Any]) -> None:
     path = _state_file(browser, name)
-    temporary = path.with_suffix(".tmp")
+    # Unique per writer: control events arrive concurrently
+    temporary = path.with_suffix(f".{uuid.uuid4().hex}.tmp")
     temporary.write_text(json.dumps(value))
     temporary.replace(path)
 
@@ -352,4 +353,6 @@ with gr.Blocks(title="InSpatio-World 1.5") as demo:
     )
 
 if __name__ == "__main__":
-    demo.queue(default_concurrency_limit=4).launch(theme=Soft(primary_hue="orange"))
+    demo.queue(default_concurrency_limit=4).launch(
+        theme=Soft(primary_hue="orange"), allowed_paths=[str(EXAMPLES), str(STATE_DIR)]
+    )

@@ -25,6 +25,6 @@ Interactive demo of [InSpatio-World 1.5](https://github.com/inspatio/inspatio-wo
 - Every 12 frames are generated from the camera path of your keys, a block (≈0.8 s) behind.
 
 Speed-ups used here: FP8 (torchao) DiT linear layers, ahead-of-time Inductor compilation of the
-per-block DiT prefill / denoise and VAE encoder graphs (`aoti.py`), the TAEHV decoder, cached
+per-block DiT prefill / denoise graphs (`aoti.py`), the TAEHV decoder, cached
 text keys/values, and depth-splat rendering without border contention. The viewer is a custom
 Svelte component (`component/`, built wheel in `wheels/`).

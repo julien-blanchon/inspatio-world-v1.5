@@ -409,8 +409,9 @@ Project-wide PyTorch idioms for an inference-only library. (Autograd context, de
 
 - Local: `WorldConfig.compile` regionally compiles the DiT block and the VAE encoder stages with
   static shapes (`mode="max-autotune-no-cudagraphs"`), the same code path traced or eager.
-- ZeroGPU: `space/aoti.py` AoT-compiles only the steady-state per-block graphs (DiT prefill,
-  DiT denoise, one VAE encoder chunk) and dispatches by shape; first-block shapes stay eager.
+- ZeroGPU: `space/aoti.py` AoT-compiles only the steady-state DiT graphs (prefill, denoise)
+  and dispatches by shape; first-block shapes stay eager. An AoT graph of one VAE encoder chunk
+  (cache tensors in and out) was measured to corrupt the returned cache tails and was dropped.
 
 **Measured and rejected (do not reintroduce without a new measurement)**
 
