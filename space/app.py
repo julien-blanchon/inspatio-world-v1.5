@@ -262,18 +262,21 @@ def start(
     yield WorldViewerData(status="loading", message="Waiting for a GPU…")
 
     chunk_ids = itertools.count()
-    for item in run_session(
-        scene_path, prompt, quality, camera, speed, int(seed), seconds, browser
-    ):
-        if "ended" in item:
-            yield WorldViewerData(status="ended", message=item["ended"])
-            return
-        frames = _jpeg_uris(item["frames"], quality=85)
-        renders = _jpeg_uris(item["renders"], quality=70)
-        chunk = Chunk(
-            id=next(chunk_ids), session=session_id, fps=fps, frames=frames, renders=renders
-        )
-        yield WorldViewerData(status="running", chunk=chunk, stats=item["stats"])
+    blocks = run_session(scene_path, prompt, quality, camera, speed, int(seed), seconds, browser)
+    try:
+        for item in blocks:
+            if "ended" in item:
+                yield WorldViewerData(status="ended", message=item["ended"])
+                return
+            frames = _jpeg_uris(item["frames"], quality=85)
+            renders = _jpeg_uris(item["renders"], quality=70)
+            chunk = Chunk(
+                id=next(chunk_ids), session=session_id, fps=fps, frames=frames, renders=renders
+            )
+            yield WorldViewerData(status="running", chunk=chunk, stats=item["stats"])
+    except gr.Error as error:
+        # e.g. ZeroGPU's quota message: show it in the viewer instead of a bare "Error"
+        yield WorldViewerData(status="error", message=str(error.message))
 
 
 def _jpeg_uris(frames: np.ndarray, quality: int) -> list[str]:
