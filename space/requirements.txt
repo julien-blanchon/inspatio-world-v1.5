@@ -1,0 +1,5 @@
+torch==2.13.0
+torchao==0.18.0
+simplejpeg
+inspatio-world @ git+https://github.com/julien-blanchon/inspatio-world-v1.5
+./wheels/gradio_worldviewer-0.1.0-py3-none-any.whl

@@ -1,0 +1,77 @@
+[project]
+name = "inspatio-world"
+version = "0.1.0"
+description = "InSpatio-World 1.5 inference: a real-time, camera-controllable 4D world model, reimplemented with minimal dependencies"
+readme = "README.md"
+license = "Apache-2.0"
+authors = [{ name = "Julien Blanchon", email = "julien@blanchon.cc" }]
+requires-python = ">=3.12"
+dependencies = [
+    "av>=15.0.0",
+    "einops>=0.8.0",
+    "huggingface-hub[torch,hf_xet]>=1.0.0",
+    "jaxtyping>=0.3.0",
+    "numpy>=2.1",
+    "pillow>=11.0",
+    "safetensors>=0.5.0",
+    "tokenizers>=0.22",
+    "torch>=2.10.0",
+    "tyro>=1.0.0",
+]
+
+[project.optional-dependencies]
+fp8 = ["torchao>=0.16"]
+
+[project.scripts]
+inspatio-world = "inspatio_world.scripts.cli:main"
+
+[project.urls]
+Repository = "https://github.com/julien-blanchon/inspatio-world-v1.5"
+Weights = "https://huggingface.co/blanchon/inspatio-world-v1.5"
+Demo = "https://huggingface.co/spaces/blanchon/inspatio-world-v1.5"
+Upstream = "https://github.com/inspatio/inspatio-world-v1.5"
+
+[dependency-groups]
+dev = ["basedpyright>=1.39", "ruff>=0.15"]
+
+[build-system]
+requires = ["uv_build>=0.11.29,<0.12.0"]
+build-backend = "uv_build"
+
+[tool.ruff]
+line-length = 100
+extend-exclude = ["space/component"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "C4", "C90", "RUF", "PIE", "PERF", "NPY", "FURB", "PTH", "RET", "ANN"]
+# F722/F821: jaxtyping shape strings look like undefined names. UP037: would strip quotes from
+# single-axis jaxtyping annotations. ANN002/ANN003/ANN401: *args/**kwargs/Any stay unannotated.
+# E501: the formatter owns line length; dense tensor expressions read better unwrapped.
+ignore = ["F722", "F821", "UP037", "ANN002", "ANN003", "ANN401", "E501"]
+
+[tool.ruff.lint.isort]
+required-imports = ["from __future__ import annotations"]
+known-first-party = ["inspatio_world"]
+
+[tool.ruff.lint.mccabe]
+max-complexity = 12
+
+[tool.basedpyright]
+include = ["src", "space"]
+exclude = [".venv", "space/component"]
+reportAny = false
+reportCallInDefaultInitializer = false
+reportExplicitAny = false
+reportUnannotatedClassAttribute = false
+reportUnusedCallResult = false
+reportImplicitOverride = false
+reportUnknownArgumentType = false
+reportUnknownMemberType = false
+reportUnknownParameterType = false
+reportUnknownVariableType = false
+reportMissingParameterType = false
+reportMissingTypeStubs = false
+reportPrivateUsage = false
+reportUnreachable = false
+reportImplicitStringConcatenation = false
+reportUninitializedInstanceVariable = false

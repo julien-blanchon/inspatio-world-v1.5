@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+.venv/
+*.egg-info/
+dist/
+build/
+.ruff_cache/
+output*.mp4
+space/component/frontend/node_modules/
+space/component/.gradio/
