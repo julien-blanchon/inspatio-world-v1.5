@@ -36,6 +36,7 @@ import torch
 from gradio.themes import Soft
 from gradio_worldviewer import Chunk, WorldViewer, WorldViewerData, encode_frame
 from huggingface_hub import snapshot_download
+from PIL import Image
 
 from inspatio_world import (
     CameraAction,
@@ -73,9 +74,9 @@ EXAMPLES = (
 )
 
 
-@spaces.GPU(duration=1500)
-def compile_world() -> dict[str, Any]:
-    return aoti.compile_graphs(world)
+@spaces.GPU(duration=900)
+def compile_world() -> dict[str, bytes]:
+    return aoti.load_or_compile(world)
 
 
 if os.environ.get("INSPATIO_AOTI", "1") == "1":
@@ -132,22 +133,25 @@ def estimate_scene(kind: str, pictures: np.ndarray, prompt: str, fps: float) -> 
     return str(folder)
 
 
-def build_upload(images: list[str] | None, video: str | None, prompt: str) -> tuple[str, str, str]:
+def build_upload(
+    images: list[str] | None, video: str | None, prompt: str
+) -> tuple[str, np.ndarray, str]:
     if video:
-        frames, fps = read_video(Path(video), max_frames=MAX_UPLOAD_FRAMES)
-        folder = estimate_scene("video", frames, prompt, fps)
+        pictures, fps = read_video(Path(video), max_frames=MAX_UPLOAD_FRAMES)
+        folder = estimate_scene("video", pictures, prompt, fps)
     elif images:
         pictures = np.stack([read_image(Path(path)) for path in images[:4]])
         folder = estimate_scene("image", pictures, prompt, 15.0)
     else:
         raise gr.Error("Upload one to four images of a place, or a video.")
-    return folder, str(Path(folder) / "view_00.png") if not video else "", prompt
+    return folder, pictures[0], prompt
 
 
-def select_example(event: gr.SelectData) -> tuple[str, str, str]:
+def select_example(event: gr.SelectData) -> tuple[str, np.ndarray, str]:
+    # The poster goes out as pixels: Hub-cache paths are symlinks Gradio refuses to serve
     folder = EXAMPLES / example_choices()[event.index][1]
     meta = json.loads((folder / "scene.json").read_text())
-    return str(folder), str(folder / "poster.jpg"), meta["prompt"]
+    return str(folder), np.asarray(Image.open(folder / "poster.jpg")), meta["prompt"]
 
 
 # --- the session ---
@@ -356,5 +360,4 @@ if __name__ == "__main__":
     demo.queue(default_concurrency_limit=4).launch(
         theme=Soft(primary_hue="orange"),
         allowed_paths=[str(EXAMPLES), str(STATE_DIR)],
-        ssr_mode=False,  # the SSR proxy drops the custom component's requests on Spaces
     )
