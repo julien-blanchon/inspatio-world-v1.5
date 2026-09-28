@@ -7,7 +7,8 @@ from typing import Literal
 
 WEIGHTS_REPO = "blanchon/inspatio-world-v1.5"
 
-# The Wan2.1 VAE decoder as trained with, or TAEHV's distilled decoder (~20x cheaper, softer)
+# TAEHV's distilled decoder (default: ~20x cheaper, slightly softer) or the Wan2.1 VAE decoder
+# the model was trained with (sharpest, ~270 ms per block)
 DecoderKind = Literal["wan", "taehv"]
 # DiT linear layers in bf16 as released, or float8 (dynamic per-row activation and weight scales,
 # torchao; the `fp8` extra) on GPUs with fp8 tensor cores (Hopper, Ada, Blackwell)
@@ -21,7 +22,7 @@ class WorldConfig:
     repo_id: str = WEIGHTS_REPO
     revision: str | None = None
     device: str = "cuda"
-    decoder: DecoderKind = "wan"
+    decoder: DecoderKind = "taehv"
     dit_precision: DiTPrecision = "bf16"
     # The 5.7B text encoder only runs once per prompt; "cpu" keeps its 11 GB off the GPU
     text_encoder_device: str = "cuda"

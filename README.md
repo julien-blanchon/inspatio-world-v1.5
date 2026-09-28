@@ -16,14 +16,14 @@ inspatio-world prepare --source.paths photo.jpg --output scenes/photo
 # fly through it with scripted moves (or --trajectory cameras.txt)
 inspatio-world generate --source.paths scenes/photo \
     --moves forward:36 turn-right+forward:36 look-up:12 --output photo.mp4 \
-    --world.decoder taehv --world.dit-precision fp8 --world.compile
+    --world.dit-precision fp8 --world.compile
 ```
 
 ```python
 from inspatio_world import CameraAction, CameraRig, WorldConfig, WorldModel
 from inspatio_world.data import load_scene
 
-world = WorldModel.from_pretrained(WorldConfig(decoder="taehv", dit_precision="fp8"))
+world = WorldModel.from_pretrained(WorldConfig(dit_precision="fp8"))
 scene = load_scene(Path("scenes/photo"))
 session, rig = world.start(scene, seed=0), CameraRig(scene)
 while not session.finished:
@@ -41,7 +41,7 @@ Each block of 3 latents (12 frames at 832x480; the first block is 9 frames):
 3. **Denoise** — the causal Wan2.1-1.3B DiT prefills a KV cache from the clean context (source
    block + previous prediction) and denoises the block in 4 flow-matching steps, conditioned on
    the render latents and mask (`wan/dit.py`, `sampler.py`).
-4. **Decode** — the Wan2.1 VAE decoder (or the ~20x cheaper TAEHV decoder) streams out frames.
+4. **Decode** — the TAEHV decoder (default, ~20x cheaper) or the Wan2.1 VAE decoder (`decoder="wan"`, sharpest) streams out frames.
 
 All causal state lives in a `Session`, so a streamed video equals the offline one.
 

@@ -50,7 +50,7 @@ inspatio-world generate --source.paths photo.jpg --moves forward:36 turn-right+f
 from inspatio_world import CameraAction, CameraRig, WorldConfig, WorldModel
 from inspatio_world.data import load_scene
 
-world = WorldModel.from_pretrained(WorldConfig(decoder="taehv", dit_precision="fp8", compile=True))
+world = WorldModel.from_pretrained(WorldConfig(dit_precision="fp8", compile=True))
 scene = load_scene(examples_dir / "image_example_00")
 session, rig = world.start(scene), CameraRig(scene)
 while True:
