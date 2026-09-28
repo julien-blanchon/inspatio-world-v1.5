@@ -59,7 +59,10 @@ SESSION_SECONDS = 90  # upper bound of a session's GPU time
 DEFAULT_SESSION_SECONDS = 45  # (45 + margin) x 2 (xlarge) fits the 120 s anonymous daily quota
 SESSION_MARGIN_SECONDS = 10  # scene loading, prompt encoding and the eager first block
 SECONDS_ARG = 6  # position of `seconds` in run_session's arguments
-MAX_LEAD_SECONDS = 1.0  # generation may run this far ahead of playback before it waits
+# Playback runs below the ~14 fps the GPU generates, so the viewer's buffer never drains
+PLAYBACK_FPS = 12.0
+PREBUFFER_FRAMES = 16  # ~1.3 s buffered once at start: absorbs 12-frame bursts and network jitter
+MAX_LEAD_SECONDS = 2.0  # generation may run this far ahead of playback before it waits
 MAX_UPLOAD_FRAMES = 180
 RENDER_PREVIEW_STRIDE = 4  # picture-in-picture render at 1/4 resolution
 STATE_DIR = Path(tempfile.gettempdir()) / "inspatio-sessions"
@@ -220,7 +223,7 @@ def run_session(
         }
 
         # Stay at most MAX_LEAD_SECONDS ahead of playback so key presses show up quickly
-        lead = session.frame_index / scene.fps - (time.perf_counter() - started)
+        lead = session.frame_index / playback_fps(scene.fps) - (time.perf_counter() - started)
         if lead > MAX_LEAD_SECONDS:
             time.sleep(lead - MAX_LEAD_SECONDS)
     yield {"ended": reason}
@@ -255,7 +258,7 @@ def start(
         return
     browser, session_id = request.session_hash or "anonymous", uuid.uuid4().hex[:8]
     write_state(browser, "control", asdict(CameraAction()))
-    fps = load_scene_fps(scene_path)
+    fps = playback_fps(load_scene_fps(scene_path))
     yield WorldViewerData(status="loading", message="Waiting for a GPU…")
 
     chunk_ids = itertools.count()
@@ -280,6 +283,10 @@ def _jpeg_uris(frames: np.ndarray, quality: int) -> list[str]:
         )
         for frame in frames
     ]
+
+
+def playback_fps(scene_fps: float) -> float:
+    return min(scene_fps, PLAYBACK_FPS)
 
 
 def load_scene_fps(scene_path: str) -> float:
@@ -311,7 +318,12 @@ with gr.Blocks(title="InSpatio-World 1.5") as demo:
     scene_path = gr.State(None)
     with gr.Row():
         with gr.Column(scale=3):
-            viewer = WorldViewer(label="World", show_label=False, show_render=False)
+            viewer = WorldViewer(
+                label="World",
+                show_label=False,
+                show_render=False,
+                prebuffer_frames=PREBUFFER_FRAMES,
+            )
         with gr.Column(scale=1, min_width=300):
             poster = gr.Image(label="Scene", interactive=False, height=180)
             prompt = gr.Textbox(
