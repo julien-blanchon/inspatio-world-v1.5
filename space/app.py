@@ -354,5 +354,7 @@ with gr.Blocks(title="InSpatio-World 1.5") as demo:
 
 if __name__ == "__main__":
     demo.queue(default_concurrency_limit=4).launch(
-        theme=Soft(primary_hue="orange"), allowed_paths=[str(EXAMPLES), str(STATE_DIR)]
+        theme=Soft(primary_hue="orange"),
+        allowed_paths=[str(EXAMPLES), str(STATE_DIR)],
+        ssr_mode=False,  # the SSR proxy drops the custom component's requests on Spaces
     )
