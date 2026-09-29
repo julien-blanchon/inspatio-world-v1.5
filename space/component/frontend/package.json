@@ -1,6 +1,6 @@
 {
   "name": "gradio_worldviewer",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "description": "WorldViewer Gradio custom component",
   "type": "module",
   "author": "",
@@ -23,7 +23,11 @@
     "@gradio/atoms": "0.26.2",
     "@gradio/statustracker": "0.15.3",
     "@gradio/utils": "0.14.2",
-    "svelte": "^5.48.0"
+    "@threlte/core": "^8.6.1",
+    "@threlte/extras": "^9.22.0",
+    "@types/three": "^0.186.0",
+    "svelte": "^5.48.0",
+    "three": "^0.186.1"
   },
   "devDependencies": {
     "@gradio/preview": "0.17.1"

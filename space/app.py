@@ -1,8 +1,10 @@
 """InSpatio-World 1.5 on ZeroGPU: drive a camera through a scene in real time.
 
-Pick an example or upload a picture / video (depth and cameras are estimated with
-Depth-Anything-3), press Start, click the viewer and fly with WASD / arrows. Each block of 12
-frames is generated from the camera path the keys produced while the previous block was playing.
+Pick a scene (or upload a picture / video: depth and cameras come from Depth-Anything-3, video
+prompts from Florence-2), pick a camera path (your keyboard, or a preset), press Start. Each block
+of 12 frames is generated from the camera path of the previous ~block, so the viewer shows what
+the model conditions on (the point cloud splatted into your camera), the camera path in 3D, and a
+timeline of your key presses against the frames that play them.
 
 Process layout on ZeroGPU: the Gradio server (main process) receives the viewer's control events
 and writes the latest camera action to a small file per browser session; the `@spaces.GPU`
@@ -16,6 +18,7 @@ import spaces  # must be imported before torch on ZeroGPU
 
 # isort: split
 
+import base64
 import itertools
 import json
 import logging
@@ -34,7 +37,7 @@ import numpy as np
 import simplejpeg
 import torch
 from gradio.themes import Soft
-from gradio_worldviewer import Chunk, WorldViewer, WorldViewerData, encode_frame
+from gradio_worldviewer import WorldViewer, encode_frame
 from huggingface_hub import snapshot_download
 from PIL import Image
 
@@ -47,8 +50,10 @@ from inspatio_world import (
     WorldConfig,
     WorldModel,
     load_depth_estimator,
+    parse_moves,
 )
 from inspatio_world.data import load_scene, read_image, read_trajectory, read_video, save_scene
+from inspatio_world.utils import component_dir
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("inspatio-space")
@@ -61,10 +66,14 @@ SESSION_MARGIN_SECONDS = 10  # scene loading, prompt encoding and the eager firs
 SECONDS_ARG = 6  # position of `seconds` in run_session's arguments
 # Playback runs below the ~14 fps the GPU generates, so the viewer's buffer never drains
 PLAYBACK_FPS = 12.0
-PREBUFFER_FRAMES = 16  # ~1.3 s buffered once at start: absorbs 12-frame bursts and network jitter
-MAX_LEAD_SECONDS = 2.0  # generation may run this far ahead of playback before it waits
+PREBUFFER_FRAMES = 8  # ~0.7 s buffered once at start
+MAX_LEAD_SECONDS = 1.0  # generation may run this far ahead of playback before it waits
 MAX_UPLOAD_FRAMES = 180
-RENDER_PREVIEW_STRIDE = 4  # picture-in-picture render at 1/4 resolution
+RENDER_PREVIEW_STRIDE = 2  # the condition panel shows the render at half resolution
+SCENE_POINTS = 30_000  # sparse point cloud sent to the 3D camera view
+POINT_VIEWS = 4  # views of a video sampled for that point cloud
+KEYBOARD, ORIGINAL_PATH = "Keyboard", "Original path"
+CAPTION_TASK = "<MORE_DETAILED_CAPTION>"
 STATE_DIR = Path(tempfile.gettempdir()) / "inspatio-sessions"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
@@ -77,6 +86,21 @@ EXAMPLES = (
     if Path(REPO_ID).is_dir()
     else Path(snapshot_download(REPO_ID, allow_patterns=["examples/*"])) / "examples"
 )
+PRESETS_FILE = EXAMPLES / "trajectories" / "presets.json"
+PRESETS: list[dict[str, Any]] = (
+    json.loads(PRESETS_FILE.read_text()) if PRESETS_FILE.exists() else []
+)
+
+
+def _load_captioner() -> tuple[Any, Any]:
+    from transformers import AutoProcessor, Florence2ForConditionalGeneration
+
+    folder = component_dir(REPO_ID, None, "captioner")
+    model = Florence2ForConditionalGeneration.from_pretrained(folder, dtype=torch.bfloat16)
+    return AutoProcessor.from_pretrained(folder), model.to("cuda").eval()  # pyright: ignore[reportArgumentType]
+
+
+caption_processor, caption_model = _load_captioner()
 
 
 @spaces.GPU(duration=900)
@@ -104,12 +128,15 @@ def write_state(browser: str, name: str, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def read_action(browser: str) -> CameraAction:
+def read_control(browser: str) -> tuple[CameraAction, int | None]:
+    """The latest camera action of this browser and the sequence number of its control event."""
+
     try:
         data = json.loads(_state_file(browser, "control").read_text())
     except (OSError, ValueError):
-        return CameraAction()
-    return CameraAction(**{axis: float(data.get(axis, 0.0)) for axis in asdict(CameraAction())})
+        return CameraAction(), None
+    action = CameraAction(**{axis: float(data.get(axis, 0.0)) for axis in asdict(CameraAction())})
+    return action, data.get("seq")
 
 
 def stop_requested(browser: str, since: float) -> bool:
@@ -122,20 +149,45 @@ def stop_requested(browser: str, since: float) -> bool:
 
 
 # --- scenes ---
+def example_folders() -> list[Path]:
+    """Scene folders, image scenes first (they run as long as you steer), then videos."""
+
+    folders = [f for f in EXAMPLES.iterdir() if (f / "scene.json").exists()]
+    kind = {f: json.loads((f / "scene.json").read_text())["kind"] for f in folders}
+    return sorted(folders, key=lambda f: (kind[f] == "video", f.name))
+
+
 def example_choices() -> list[tuple[str, str]]:
-    return [
-        (str(folder / "poster.jpg"), folder.name)
-        for folder in sorted(EXAMPLES.iterdir())
-        if folder.is_dir()
-    ]
+    return [(str(f / "poster.jpg"), f.name.replace("_", " ")) for f in example_folders()]
 
 
-@spaces.GPU(duration=60)
-def estimate_scene(kind: str, pictures: np.ndarray, prompt: str, fps: float) -> str:
-    scene = Scene.estimate(kind, pictures, depth_estimator, prompt=prompt, fps=fps)  # pyright: ignore[reportArgumentType]
+def preset_choices() -> list[tuple[str, str]]:
+    return [(str(EXAMPLES / "trajectories" / p["preview"]), p["name"]) for p in PRESETS]
+
+
+def caption(image: np.ndarray) -> str:
+    """Florence-2 detailed caption of a frame, as upstream v1 prompts its videos."""
+
+    picture = Image.fromarray(image)
+    inputs = caption_processor(text=CAPTION_TASK, images=picture, return_tensors="pt")
+    inputs = inputs.to("cuda", torch.bfloat16)
+    ids = caption_model.generate(**inputs, max_new_tokens=256, do_sample=False, num_beams=3)
+    text = caption_processor.batch_decode(ids, skip_special_tokens=False)[0]
+    parsed = caption_processor.post_process_generation(
+        text, task=CAPTION_TASK, image_size=picture.size
+    )
+    return str(parsed[CAPTION_TASK]).strip()
+
+
+@spaces.GPU(duration=90)
+def estimate_scene(kind: str, pictures: np.ndarray, prompt: str, fps: float) -> tuple[str, str]:
+    with torch.inference_mode():
+        if kind == "video" and not prompt.strip():
+            prompt = caption(pictures[0])
+        scene = Scene.estimate(kind, pictures, depth_estimator, prompt=prompt, fps=fps)  # pyright: ignore[reportArgumentType]
     folder = STATE_DIR / f"scene-{uuid.uuid4().hex[:12]}"
     save_scene(scene, folder)
-    return str(folder)
+    return str(folder), prompt
 
 
 def build_upload(
@@ -143,10 +195,10 @@ def build_upload(
 ) -> tuple[str, np.ndarray, str]:
     if video:
         pictures, fps = read_video(Path(video), max_frames=MAX_UPLOAD_FRAMES)
-        folder = estimate_scene("video", pictures, prompt, fps)
+        folder, prompt = estimate_scene("video", pictures, prompt, fps)
     elif images:
         pictures = np.stack([read_image(Path(path)) for path in images[:4]])
-        folder = estimate_scene("image", pictures, prompt, 15.0)
+        folder, prompt = estimate_scene("image", pictures, prompt, 15.0)
     else:
         raise gr.Error("Upload one to four images of a place, or a video.")
     return folder, pictures[0], prompt
@@ -154,9 +206,92 @@ def build_upload(
 
 def select_example(event: gr.SelectData) -> tuple[str, np.ndarray, str]:
     # The poster goes out as pixels: Hub-cache paths are symlinks Gradio refuses to serve
-    folder = EXAMPLES / example_choices()[event.index][1]
+    folder = example_folders()[event.index]
     meta = json.loads((folder / "scene.json").read_text())
     return str(folder), np.asarray(Image.open(folder / "poster.jpg")), meta["prompt"]
+
+
+def select_preset(event: gr.SelectData) -> str:
+    return PRESETS[event.index]["name"]
+
+
+# --- what the viewer shows next to the video ---
+def scene_info(scene: Scene, title: str) -> dict[str, Any]:
+    """A sparse colored point cloud of the source views and their cameras, for the 3D view."""
+
+    views = range(scene.num_views)
+    if scene.kind == "video":
+        views = np.linspace(0, scene.num_views - 1, min(POINT_VIEWS, scene.num_views)).astype(int)
+    generator = np.random.default_rng(0)
+    points, colors = [], []
+    for view in views:
+        depth = scene.depth[view].numpy()
+        rows, cols = np.nonzero(depth > 0)
+        pick = generator.choice(
+            len(rows), min(len(rows), SCENE_POINTS // len(views)), replace=False
+        )
+        rows, cols = rows[pick], cols[pick]
+        z = depth[rows, cols]
+        k = scene.intrinsics[view].numpy()
+        local = np.stack(
+            [(cols - k[0, 2]) * z / k[0, 0], (rows - k[1, 2]) * z / k[1, 1], z, np.ones_like(z)]
+        )
+        camera_to_world = np.linalg.inv(scene.world_to_camera[view].numpy())
+        points.append((camera_to_world @ local)[:3].T)
+        colors.append(scene.images[view].numpy()[rows, cols])
+    k = scene.intrinsics[0].numpy()
+    return {
+        "points": base64.b64encode(np.concatenate(points).astype("<f4").tobytes()).decode(),
+        "colors": base64.b64encode(np.concatenate(colors).astype(np.uint8).tobytes()).decode(),
+        "source_poses": [
+            np.linalg.inv(p).reshape(-1).tolist() for p in scene.world_to_camera.numpy()
+        ],
+        "intrinsics": [
+            float(k[0, 0]),
+            float(k[1, 1]),
+            float(k[0, 2]),
+            float(k[1, 2]),
+            832.0,
+            480.0,
+        ],
+        "kind": scene.kind,
+        "title": title,
+    }
+
+
+class CameraPath:
+    """Per-frame target cameras from the keyboard, a preset script or the scene's original path."""
+
+    def __init__(self, scene: Scene, folder: Path, camera: str, speed: float, browser: str) -> None:
+        self.rig = CameraRig(scene, RigConfig(move_speed=RigConfig().move_speed * speed))
+        self.browser = browser
+        self.trajectory: torch.Tensor | None = None
+        self.script: list[CameraAction] | None = None
+        if camera == ORIGINAL_PATH and (folder / "trajectory.txt").exists():
+            self.trajectory = torch.from_numpy(read_trajectory(folder / "trajectory.txt"))
+        preset = next((p for p in PRESETS if p["name"] == camera), None)
+        if preset is not None:
+            plan = parse_moves(tuple(preset["moves"]))
+            self.script = [action for action, frames in plan for _ in range(frames)]
+
+    @property
+    def length(self) -> int | None:
+        if self.trajectory is not None:
+            return len(self.trajectory)
+        return len(self.script) if self.script is not None else None
+
+    def next(self, start: int, count: int) -> tuple[torch.Tensor, list[Any], list[int | None]]:
+        """Target world-to-camera poses of frames `start..start+count`, their actions and seqs."""
+
+        if self.trajectory is not None:
+            index = torch.arange(start, start + count).clamp(max=len(self.trajectory) - 1)
+            return self.trajectory[index], [None] * count, [None] * count
+        if self.script is not None:
+            actions = [self.script[min(start + i, len(self.script) - 1)] for i in range(count)]
+            poses = torch.cat([self.rig.advance(action, 1) for action in actions])
+            return poses, [asdict(a) for a in actions], [None] * count
+        action, seq = read_control(self.browser)
+        return self.rig.advance(action, count), [asdict(action)] * count, [seq] * count
 
 
 # --- the session ---
@@ -177,45 +312,41 @@ def run_session(
     seconds: float,
     browser: str,
 ) -> Iterator[dict[str, Any]]:
-    """Yield {"frames", "renders", "stats"} per block, then {"ended": reason}."""
+    """Yield {"scene"} once, then {"frames", "renders", "poses", "actions", ...} per block,
+    then {"ended": reason}."""
 
     folder = Path(scene_path)
     scene = load_scene(folder)
+    yield {"scene": scene_info(scene, folder.name.replace("_", " "))}
     text_kv = world.encode_prompt(prompt)
     decoder = world.vae if quality == "Quality (Wan VAE decoder)" else world.decoder
     session = Session(scene, world.dit, world.vae, decoder, world.schedule, text_kv, seed)
-    rig = CameraRig(scene, RigConfig(move_speed=RigConfig().move_speed * speed))
-    trajectory = None
-    if camera == "Example trajectory" and (folder / "trajectory.txt").exists():
-        trajectory = torch.from_numpy(read_trajectory(folder / "trajectory.txt"))
+    path = CameraPath(scene, folder, camera, speed, browser)
+    fps = playback_fps(scene.fps)
 
     started, started_wall = time.perf_counter(), time.time()
-    while (
-        reason := _end_reason(session, trajectory, time.perf_counter() - started, seconds)
-    ) is None:
+    while (reason := _end_reason(session, path, time.perf_counter() - started, seconds)) is None:
         if stop_requested(browser, started_wall):
             reason = "Stopped"
             break
 
-        count = session.frames_needed
-        if trajectory is not None:
-            index = torch.arange(session.frame_index, session.frame_index + count).clamp(
-                max=len(trajectory) - 1
-            )
-            poses = trajectory[index]
-        else:
-            poses = rig.advance(read_action(browser), count)
+        poses, actions, seqs = path.next(session.frame_index, session.frames_needed)
         block_start = time.perf_counter()
         block = session.step(poses)
         frames = block.frames.cpu().numpy()
-        renders = block.render[:, ::RENDER_PREVIEW_STRIDE, ::RENDER_PREVIEW_STRIDE].cpu().numpy()
+        stride = RENDER_PREVIEW_STRIDE
+        renders = block.render[:, ::stride, ::stride].cpu().numpy()
         block_seconds = time.perf_counter() - block_start
+        valid = len(frames)
         yield {
             "frames": frames,
             "renders": renders,
+            "poses": [np.linalg.inv(p).reshape(-1).tolist() for p in poses[:valid].numpy()],
+            "actions": actions[:valid],
+            "control_seqs": seqs[:valid],
             "stats": {
                 "block_ms": round(block_seconds * 1000, 1),
-                "gen_fps": round(len(frames) / block_seconds, 1),
+                "gen_fps": round(valid / block_seconds, 1),
                 "frames": session.frame_index,
                 "elapsed_s": round(time.perf_counter() - started, 1),
                 "limit_s": seconds,
@@ -223,17 +354,15 @@ def run_session(
         }
 
         # Stay at most MAX_LEAD_SECONDS ahead of playback so key presses show up quickly
-        lead = session.frame_index / playback_fps(scene.fps) - (time.perf_counter() - started)
+        lead = session.frame_index / fps - (time.perf_counter() - started)
         if lead > MAX_LEAD_SECONDS:
             time.sleep(lead - MAX_LEAD_SECONDS)
     yield {"ended": reason}
 
 
-def _end_reason(
-    session: Session, trajectory: torch.Tensor | None, elapsed: float, seconds: float
-) -> str | None:
-    if trajectory is not None and session.frame_index >= len(trajectory):
-        return "End of the example trajectory"
+def _end_reason(session: Session, path: CameraPath, elapsed: float, seconds: float) -> str | None:
+    if path.length is not None and session.frame_index >= path.length:
+        return "End of the camera path"
     if session.finished:
         return "End of the source video"
     if elapsed > seconds:
@@ -250,33 +379,40 @@ def start(
     seed: int,
     seconds: float,
     request: gr.Request,
-) -> Iterator[WorldViewerData]:
+) -> Iterator[dict[str, Any]]:
     if not scene_path:
-        yield WorldViewerData(
-            status="error", message="Pick an example or build a scene from your upload first."
-        )
+        yield {"status": "error", "message": "Pick a scene first."}
         return
     browser, session_id = request.session_hash or "anonymous", uuid.uuid4().hex[:8]
     write_state(browser, "control", asdict(CameraAction()))
     fps = playback_fps(load_scene_fps(scene_path))
-    yield WorldViewerData(status="loading", message="Waiting for a GPU…")
+    yield {"status": "loading", "message": "Waiting for a GPU…"}
 
-    chunk_ids = itertools.count()
+    chunk_ids, scene = itertools.count(), None
     blocks = run_session(scene_path, prompt, quality, camera, speed, int(seed), seconds, browser)
     try:
         for item in blocks:
+            if "scene" in item:
+                scene = item["scene"]
+                continue
             if "ended" in item:
-                yield WorldViewerData(status="ended", message=item["ended"])
+                yield {"status": "ended", "message": item["ended"]}
                 return
-            frames = _jpeg_uris(item["frames"], quality=85)
-            renders = _jpeg_uris(item["renders"], quality=70)
-            chunk = Chunk(
-                id=next(chunk_ids), session=session_id, fps=fps, frames=frames, renders=renders
-            )
-            yield WorldViewerData(status="running", chunk=chunk, stats=item["stats"])
+            chunk = {
+                "id": next(chunk_ids),
+                "session": session_id,
+                "fps": fps,
+                "frames": _jpeg_uris(item["frames"], quality=85),
+                "renders": _jpeg_uris(item["renders"], quality=75),
+                "poses": item["poses"],
+                "actions": item["actions"],
+                "control_seqs": item["control_seqs"],
+            }
+            yield {"status": "running", "chunk": chunk, "stats": item["stats"], "scene": scene}
+            scene = None  # the point cloud goes out once, with the first chunk
     except gr.Error as error:
         # e.g. ZeroGPU's quota message: show it in the viewer instead of a bare "Error"
-        yield WorldViewerData(status="error", message=str(error.message))
+        yield {"status": "error", "message": str(error.message)}
 
 
 def _jpeg_uris(frames: np.ndarray, quality: int) -> list[str]:
@@ -300,71 +436,78 @@ def on_control(event: gr.EventData, request: gr.Request) -> None:
     write_state(request.session_hash or "anonymous", "control", event._data)
 
 
-def on_stop(request: gr.Request) -> WorldViewerData:
+def on_stop(request: gr.Request) -> dict[str, Any]:
     write_state(request.session_hash or "anonymous", "stop", {"time": time.time()})
-    return WorldViewerData(status="ended", message="Stopped")
+    return {"status": "ended", "message": "Stopped"}
 
 
 # --- UI ---
-DESCRIPTION = """
-# InSpatio-World 1.5 — a real-time 4D world model
-Pick a scene, press **Start**, then click the viewer and fly with **W A S D** (move),
-**← →** or **Q E** (turn), **R F** (look up / down), **Space / Shift** (up / down).
-The model (Wan2.1-1.3B, causal, 4 steps per block) re-renders the scene from the camera you steer,
-12 frames at a time. [Code](https://github.com/julien-blanchon/inspatio-world-v1.5) ·
-[Weights](https://huggingface.co/blanchon/inspatio-world-v1.5) ·
-[Paper](https://arxiv.org/abs/2604.07209) · [Upstream](https://github.com/inspatio/inspatio-world-v1.5)
+TITLE = """
+<div style="display:flex;align-items:baseline;gap:.75rem;flex-wrap:wrap">
+<h2 style="margin:0">InSpatio-World 1.5</h2>
+<span style="opacity:.7;font-size:.9rem">
+<a href="https://github.com/julien-blanchon/inspatio-world-v1.5">Code</a> ·
+<a href="https://huggingface.co/blanchon/inspatio-world-v1.5">Weights</a> ·
+<a href="https://arxiv.org/abs/2604.07209">Paper</a></span></div>
 """
 
 with gr.Blocks(title="InSpatio-World 1.5") as demo:
-    gr.Markdown(DESCRIPTION)
+    gr.HTML(TITLE)
     scene_path = gr.State(None)
+    viewer = WorldViewer(show_label=False, show_render=True, prebuffer_frames=PREBUFFER_FRAMES)
     with gr.Row():
         with gr.Column(scale=3):
-            viewer = WorldViewer(
-                label="World",
-                show_label=False,
-                show_render=False,
-                prebuffer_frames=PREBUFFER_FRAMES,
+            gallery = gr.Gallery(
+                value=example_choices(),
+                label="Scenes",
+                columns=5,
+                height=230,
+                allow_preview=False,
             )
-        with gr.Column(scale=1, min_width=300):
+        with gr.Column(scale=2):
+            camera = gr.Dropdown(
+                [KEYBOARD, ORIGINAL_PATH, *(p["name"] for p in PRESETS)],
+                value=KEYBOARD,
+                label="Camera path",
+                info="Keyboard, the example's original path, or a preset (below)",
+            )
+            presets = gr.Gallery(
+                value=preset_choices(),
+                label="Camera path presets",
+                columns=4,
+                height=170,
+                allow_preview=False,
+            )
+    with gr.Accordion("Scene & prompt", open=False):
+        with gr.Row():
             poster = gr.Image(label="Scene", interactive=False, height=180)
             prompt = gr.Textbox(
-                label="Prompt", lines=3, placeholder="Optional description of the scene"
+                label="Prompt",
+                lines=5,
+                placeholder="Optional; video uploads are captioned automatically",
             )
-            with gr.Accordion("Session", open=True):
-                camera = gr.Radio(
-                    ["Keyboard", "Example trajectory"], value="Keyboard", label="Camera"
-                )
-                quality = gr.Radio(
-                    ["Fast (TAEHV decoder)", "Quality (Wan VAE decoder)"],
-                    value="Fast (TAEHV decoder)",
-                    label="Decoder",
-                )
-                speed = gr.Slider(0.25, 3.0, value=1.0, step=0.25, label="Movement speed")
-                seconds = gr.Slider(
-                    15,
-                    SESSION_SECONDS,
-                    value=DEFAULT_SESSION_SECONDS,
-                    step=5,
-                    label="Session length (s)",
-                )
-                seed = gr.Number(0, label="Seed", precision=0)
-
-    gr.Markdown("### Examples — click one to load it")
-    gallery = gr.Gallery(
-        value=example_choices(), columns=6, height=160, allow_preview=False, show_label=False
-    )
-    with gr.Accordion("Your own scene", open=False):
-        gr.Markdown(
-            "One image (or up to 4 of the same place), or a short video. Depth and cameras are estimated with Depth-Anything-3."
-        )
         with gr.Row():
-            images = gr.File(file_count="multiple", file_types=["image"], label="Images")
-            video = gr.Video(label="Video", sources=["upload"])
-        build = gr.Button("Build scene")
+            images = gr.File(
+                file_count="multiple",
+                file_types=["image"],
+                label="Your images (1 to 4 of one place)",
+            )
+            video = gr.Video(label="Your video", sources=["upload"])
+        build = gr.Button("Build scene from upload")
+    with gr.Accordion("Advanced", open=False):
+        quality = gr.Radio(
+            ["Fast (TAEHV decoder)", "Quality (Wan VAE decoder)"],
+            value="Fast (TAEHV decoder)",
+            label="Decoder",
+        )
+        speed = gr.Slider(0.25, 3.0, value=1.0, step=0.25, label="Movement speed")
+        seconds = gr.Slider(
+            15, SESSION_SECONDS, value=DEFAULT_SESSION_SECONDS, step=5, label="Session length (s)"
+        )
+        seed = gr.Number(0, label="Seed", precision=0)
 
     gallery.select(select_example, None, [scene_path, poster, prompt])
+    presets.select(select_preset, None, camera)
     build.click(build_upload, [images, video, prompt], [scene_path, poster, prompt])
     start_event = viewer.start(
         start,
