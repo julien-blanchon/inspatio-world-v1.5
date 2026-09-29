@@ -39,6 +39,37 @@ class CameraAction:
     pitch: float = 0.0
 
 
+MOVES = {
+    "forward": CameraAction(forward=1),
+    "back": CameraAction(forward=-1),
+    "left": CameraAction(right=-1),
+    "right": CameraAction(right=1),
+    "up": CameraAction(up=1),
+    "down": CameraAction(up=-1),
+    "turn-left": CameraAction(yaw=-1),
+    "turn-right": CameraAction(yaw=1),
+    "look-up": CameraAction(pitch=1),
+    "look-down": CameraAction(pitch=-1),
+    "still": CameraAction(),
+}
+
+
+def parse_moves(moves: tuple[str, ...]) -> list[tuple[CameraAction, int]]:
+    """Scripted held moves: `right+turn-left*0.8:48` -> (the summed action, 48 frames)."""
+
+    plan = []
+    for move in moves:
+        names, frames = move.rsplit(":", 1)
+        total = dict.fromkeys(CameraAction.__slots__, 0.0)
+        for term in names.split("+"):
+            name, _, scale = term.partition("*")
+            action = MOVES[name]
+            for axis in total:
+                total[axis] += getattr(action, axis) * float(scale or 1)
+        plan.append((CameraAction(**total), int(frames)))
+    return plan
+
+
 @dataclass(frozen=True, slots=True)
 class RigConfig:
     move_speed: float = 0.012  # per frame, as a fraction of the source view's median depth

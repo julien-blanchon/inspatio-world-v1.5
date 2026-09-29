@@ -8,6 +8,7 @@ it is no longer needed at inference. It reads
                                     models_t5_umt5-xxl-enc-bf16.pth                  -> text_encoder/
                                     google/umt5-xxl/tokenizer.json                   -> tokenizer/
     github madebyollin/taehv        taew2_1.pth                                     -> taehv/
+    florence-community/Florence-2-base  (copied as is, transformers format)          -> captioner/
     depth-anything/DA3NESTED-GIANT-LARGE                                             -> depth/
 
 renames every state-dict key to this package's module names (fusing the DiT's q/k/v and the
@@ -29,7 +30,7 @@ from pathlib import Path
 
 import torch
 import tyro
-from huggingface_hub import HfApi, hf_hub_download
+from huggingface_hub import HfApi, hf_hub_download, snapshot_download
 from safetensors.torch import load_file
 from torch import Tensor, nn
 
@@ -48,6 +49,7 @@ from inspatio_world.wan import (
 WAN_REPO = "Wan-AI/Wan2.1-T2V-1.3B"
 INSPATIO_REPO = "inspatio/world-1.5"
 TAEHV_URL = "https://github.com/madebyollin/taehv/raw/main/taew2_1.pth"
+CAPTIONER_REPO = "florence-community/Florence-2-base"  # transformers-native Florence-2 weights
 DTYPE = torch.bfloat16
 
 type StateDict = dict[str, Tensor]
@@ -197,6 +199,13 @@ def main(config: ConvertConfig) -> None:
         urllib.request.urlretrieve(TAEHV_URL, taehv_path)
     _save(lambda: TaehvDecoder(TaehvConfig()), taehv_state(taehv_path), output / "taehv")
     shutil.rmtree(taehv_path.parent)
+
+    # Florence-2-base captions video prompts (demo / example preparation); mirrored unchanged
+    snapshot_download(
+        CAPTIONER_REPO,
+        local_dir=output / "captioner",
+        allow_patterns=["*.json", "*.txt", "*.safetensors"],
+    )
 
     if not config.skip_depth:
         from convert_depth import convert_depth  # pyright: ignore[reportMissingImports]

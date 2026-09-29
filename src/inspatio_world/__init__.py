@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from .config import WorldConfig
-from .controls import CameraAction, CameraRig, RigConfig
+from .controls import CameraAction, CameraRig, RigConfig, parse_moves
 from .scene import Scene
 from .session import BlockOutput, Session
 from .world import WorldModel, load_depth_estimator
@@ -18,4 +18,5 @@ __all__ = [
     "WorldConfig",
     "WorldModel",
     "load_depth_estimator",
+    "parse_moves",
 ]

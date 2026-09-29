@@ -14,6 +14,7 @@ base_model:
   - inspatio/world-1.5
   - Wan-AI/Wan2.1-T2V-1.3B
   - depth-anything/DA3NESTED-GIANT-LARGE
+  - florence-community/Florence-2-base
 ---
 
 # InSpatio-World 1.5 — all weights in one repository
@@ -32,7 +33,8 @@ one folder per component, each a `config.json` + `model.safetensors` pair loaded
 | `tokenizer/` | umT5 tokenizer (`tokenizer.json`) | [Wan-AI/Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B) | — | — |
 | `taehv/` | TAEHV `taew2_1` decoder (fast preview decoder) | [madebyollin/taehv](https://github.com/madebyollin/taehv) | 9.8 M | bf16 |
 | `depth/` | Depth-Anything-3 nested giant-large (depth + cameras) | [depth-anything/DA3NESTED-GIANT-LARGE](https://huggingface.co/depth-anything/DA3NESTED-GIANT-LARGE) | 1.7 B | bf16 / fp32 |
-| `examples/` | The six upstream example scenes as scene folders | [upstream examples](https://github.com/inspatio/inspatio-world-v1.5/tree/main/examples) | — | — |
+| `captioner/` | Florence-2-base (video prompts for uploads / examples), transformers format | [florence-community/Florence-2-base](https://huggingface.co/florence-community/Florence-2-base) | 0.23 B | fp32 |
+| `examples/` | Scene folders: the six upstream examples and nine scenes from the [project page](https://inspatio.github.io/inspatio-world-1.5/); `trajectories/`: camera-path presets with previews | [upstream examples](https://github.com/inspatio/inspatio-world-v1.5/tree/main/examples) | — | — |
 
 The conversion only renames keys (fusing the DiT's q/k/v and cross-attention k/v projections),
 drops unused branches (DA3's ray / Gaussian-splatting heads) and casts to the dtype each module
@@ -68,6 +70,7 @@ Each component keeps its original license:
   of [inspatio/inspatio-world-v1.5](https://github.com/inspatio/inspatio-world-v1.5).
 - `vae/`, `text_encoder/`, `tokenizer/`: Wan2.1, Apache-2.0.
 - `taehv/`: TAEHV, MIT.
+- `captioner/`: Florence-2, MIT.
 - `depth/`: Depth-Anything-3 DA3NESTED-GIANT-LARGE, **CC BY-NC 4.0 (non-commercial)**.
 - `examples/`: from the upstream repository.
 

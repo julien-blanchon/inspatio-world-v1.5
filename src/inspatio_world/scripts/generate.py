@@ -15,23 +15,10 @@ from pathlib import Path
 import numpy as np
 import torch
 
-from inspatio_world import CameraAction, CameraRig, Scene, WorldConfig, WorldModel
+from inspatio_world import CameraRig, Scene, WorldConfig, WorldModel
+from inspatio_world.controls import parse_moves
 from inspatio_world.data import read_trajectory, write_video
 from inspatio_world.scripts.prepare import SceneSource, build_scene
-
-MOVES = {
-    "forward": CameraAction(forward=1),
-    "back": CameraAction(forward=-1),
-    "left": CameraAction(right=-1),
-    "right": CameraAction(right=1),
-    "up": CameraAction(up=1),
-    "down": CameraAction(up=-1),
-    "turn-left": CameraAction(yaw=-1),
-    "turn-right": CameraAction(yaw=1),
-    "look-up": CameraAction(pitch=1),
-    "look-down": CameraAction(pitch=-1),
-    "still": CameraAction(),
-}
 
 
 @dataclass(frozen=True, slots=True)
@@ -44,29 +31,12 @@ class GenerateConfig:
     trajectory: Path | None = None
     """Per-frame world-to-camera matrices (16 numbers per line); overrides `moves`."""
     moves: tuple[str, ...] = ("forward:24", "turn-right+forward:36", "turn-left:24")
-    """Held moves `name[+name]:frames`, names from: forward back left right up down
-    turn-left turn-right look-up look-down still."""
+    """Held moves `name[*scale][+name[*scale]]:frames`, names from: forward back left right up
+    down turn-left turn-right look-up look-down still (e.g. `right+turn-left*0.8:48` orbits)."""
     seed: int = 0
     save_render: bool = True
     """Also write the splatted condition next to the output (`*_render.mp4`)."""
     world: WorldConfig = field(default_factory=WorldConfig)
-
-
-def parse_moves(moves: tuple[str, ...]) -> list[tuple[CameraAction, int]]:
-    """`forward+turn-right:24` -> (the summed action, 24 frames)."""
-
-    plan = []
-    for move in moves:
-        names, frames = move.rsplit(":", 1)
-        actions = [MOVES[name] for name in names.split("+")]
-        combined = CameraAction(
-            **{
-                axis: sum(getattr(action, axis) for action in actions)
-                for axis in CameraAction.__slots__
-            }
-        )
-        plan.append((combined, int(frames)))
-    return plan
 
 
 def camera_path(scene: Scene, config: GenerateConfig) -> torch.Tensor:

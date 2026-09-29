@@ -21,6 +21,7 @@ dependencies = [
 
 [project.optional-dependencies]
 fp8 = ["torchao>=0.16"]
+caption = ["transformers>=4.57"]  # Florence-2 captions for example / uploaded videos
 
 [project.scripts]
 inspatio-world = "inspatio_world.scripts.cli:main"
