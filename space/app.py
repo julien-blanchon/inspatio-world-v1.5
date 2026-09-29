@@ -71,7 +71,7 @@ PLAYBACK_FPS = 12.0
 # Fixed key-to-screen delay: frame f is shown at t0 + latency + f/fps. At >= ~3.2 s every frame
 # plays exactly the keys held at t0 + f/fps; below, blocks start before all their keys are known
 # and the latest keys stand in for the rest of the block.
-LATENCY_SECONDS = 2.5
+LATENCY_SECONDS = 2.0
 LATENCY_RANGE = (1.5, 4.0)
 DELIVERY_MARGIN_SECONDS = 0.35  # transport to the browser plus generation jitter
 MAX_UPLOAD_FRAMES = 180
@@ -79,12 +79,13 @@ RENDER_PREVIEW_STRIDE = 2  # the condition panel shows the render at half resolu
 SCENE_POINTS = 30_000  # sparse point cloud sent to the 3D camera view
 POINT_VIEWS = 4  # views of a video sampled for that point cloud
 KEYBOARD = "Keyboard"
+FAST, QUALITY = "Fast (TAEHV)", "Quality (Wan VAE, slower: raise the latency)"
 CAPTION_TASK = "<MORE_DETAILED_CAPTION>"
 STATE_DIR = Path(tempfile.gettempdir()) / "inspatio-sessions"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
 
 # --- models: placed on cuda at import, as ZeroGPU expects ---
-CONFIG = WorldConfig(repo_id=REPO_ID, decoder="taehv", dit_precision="fp8")
+CONFIG = WorldConfig(repo_id=REPO_ID, encoder="taehv", decoder="taehv", dit_precision="fp8")
 world = WorldModel.from_pretrained(CONFIG)
 depth_estimator = load_depth_estimator(CONFIG)
 EXAMPLES = (
@@ -380,8 +381,10 @@ def run_session(
     scene = load_scene(folder)
     yield {"scene": scene_info(scene, folder.name.replace("_", " "))}
     text_kv = world.encode_prompt(prompt)
-    decoder = world.vae if quality == "Quality (Wan VAE decoder)" else world.decoder
-    session = Session(scene, world.dit, world.vae, decoder, world.schedule, text_kv, seed)
+    # Fast: TAEHV encodes the condition streams and decodes (~0.3 s per block less than the VAE)
+    fast = quality == FAST
+    encoder, decoder = (world.encoder, world.decoder) if fast else (world.vae, world.vae)
+    session = Session(scene, world.dit, encoder, decoder, world.schedule, text_kv, seed)
     path = CameraPath(scene, folder, camera, speed, browser)
     fps = playback_fps(scene.fps)
 
@@ -564,9 +567,9 @@ with gr.Blocks(title="InSpatio-World 1.5") as demo:
         build = gr.Button("Build scene from upload")
     with gr.Accordion("Advanced", open=False):
         quality = gr.Radio(
-            ["Fast (TAEHV decoder)", "Quality (Wan VAE decoder)"],
-            value="Fast (TAEHV decoder)",
-            label="Decoder",
+            [FAST, QUALITY],
+            value=FAST,
+            label="Autoencoder",
         )
         speed = gr.Slider(0.25, 3.0, value=1.0, step=0.25, label="Movement speed")
         seconds = gr.Slider(

@@ -3,8 +3,8 @@
 The world model is causal, so a whole video equals the concatenation of its blocks as long as
 every stream keeps its state between them. A `Session` holds that state:
 
-    render encoder cache    the VAE encoder over the splatted condition frames
-    source encoder cache    the VAE encoder over the source frames the block is anchored to
+    render encoder cache    the latent encoder over the splatted condition frames
+    source encoder cache    the latent encoder over the source frames the block is anchored to
     decoder cache           the VAE (or TAEHV) decoder over the predicted latents
     previous prediction     the last block's clean latents, which join the next block's context
     noise generator         seeded once per session
@@ -38,7 +38,7 @@ from .render.splat import LiftedViews, lift_views, render
 from .sampler import FlowSchedule, denoise_block
 from .scene import Scene
 from .types import CrossAttentionCache, Frames, MaskLatents, Poses, RenderMasks, VideoLatents
-from .wan import CausalCache, CausalWanDiT, WanVAE
+from .wan import CausalCache, CausalWanDiT
 
 FRAMES_PER_LATENT = 4
 LATENTS_PER_BLOCK = 3
@@ -49,6 +49,12 @@ CONDITION_CHANNELS = 20  # 4 render-mask + 16 render-latent channels, zero in th
 ANCHOR_VIEWS = 3  # multi-view scenes: distinct source views per block, one per latent
 
 type FramesUInt8 = UInt8[Tensor, "F H W 3"]
+
+
+class LatentEncoder(Protocol):
+    """Frames in [-1, 1] -> normalized latents, streaming over a `CausalCache` (Wan VAE or TAEHV)."""
+
+    def encode(self, frames: Frames, cache: CausalCache) -> VideoLatents: ...
 
 
 class FrameDecoder(Protocol):
@@ -70,13 +76,13 @@ class Session:
         self,
         scene: Scene,
         dit: CausalWanDiT,
-        vae: WanVAE,
+        encoder: LatentEncoder,
         decoder: FrameDecoder,
         schedule: FlowSchedule,
         text_kv: CrossAttentionCache,
         seed: int,
     ) -> None:
-        self.scene, self.dit, self.vae, self.decoder = scene, dit, vae, decoder
+        self.scene, self.dit, self.encoder, self.decoder = scene, dit, encoder, decoder
         self.schedule, self.text_kv = schedule, text_kv
         self.device = text_kv.device
         self.generator = torch.Generator(self.device).manual_seed(seed)
@@ -112,10 +118,12 @@ class Session:
         rendered, mask, anchors = self._render(frames, world_to_camera.to(self.device))
 
         # Condition: render latents + downsampled mask; context: source (+ previous) latents
-        render_latents = self.vae.encode(_to_video(rendered), self.render_cache)
+        render_latents = self.encoder.encode(_to_video(rendered), self.render_cache)
         source = self._source_frames(frames, anchors)
-        source_latents = self.vae.encode(_to_video(source), self.source_cache)
-        condition = torch.cat([self._mask_latents(mask), render_latents], dim=1)
+        source_latents = self.encoder.encode(_to_video(source), self.source_cache)
+        condition = torch.cat(
+            [self._mask_latents(mask, render_latents.dtype), render_latents], dim=1
+        )
         context = [source_latents] + ([self.previous] if self.previous is not None else [])
         context = torch.cat(
             [F.pad(c, (0, 0, 0, 0, 0, 0, 0, CONDITION_CHANNELS)) for c in context], dim=2
@@ -205,10 +213,10 @@ class Session:
             )
         return self.scene.images[index].to(self.device)
 
-    def _mask_latents(self, mask: RenderMasks) -> MaskLatents:
+    def _mask_latents(self, mask: RenderMasks, dtype: torch.dtype) -> MaskLatents:
         """Render validity in {-1, 1}, bilinearly downsampled; 4 frames per latent as channels."""
 
-        signed = (mask.to(self.vae.dtype) * 2 - 1)[:, None]
+        signed = (mask.to(dtype) * 2 - 1)[:, None]
         h, w = mask.shape[1] // LATENT_SCALE, mask.shape[2] // LATENT_SCALE
         small = F.interpolate(signed, size=(h, w), mode="bilinear", align_corners=False)[:, 0]
         if self.frame_index == 0:

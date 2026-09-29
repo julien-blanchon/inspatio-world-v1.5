@@ -4,7 +4,7 @@
 `config` argument is a frozen dataclass, and this class turns the `config.json` dictionary back
 into that dataclass before construction. The stock mixin decodes through the constructor's
 annotation, which is a string under `from __future__ import annotations`, so it would hand the
-constructor a plain dict. Every model component (DiT, VAE, text encoder, TAEHV decoder, depth
+constructor a plain dict. Every model component (DiT, VAE, text encoder, TAEHV, depth
 estimator) therefore gets `save_pretrained`, `from_pretrained` and `push_to_hub` with a
 `config.json` next to `model.safetensors`, one folder per component of the weights repository.
 Modules are built without their random initialisation (`no_init`): every parameter is loaded

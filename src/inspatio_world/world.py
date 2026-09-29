@@ -1,7 +1,7 @@
 """The world model: loads every component from the weights repository and starts sessions.
 
 `WorldModel.from_pretrained` is the only reader of the weights repository. It holds the causal
-DiT, the Wan2.1 VAE (its encoder conditions every block; its decoder, or TAEHV's, renders the
+DiT, the Wan2.1 VAE and TAEHV (either encoder conditions every block, either decoder renders the
 prediction), and the umT5 text encoder, and caches each prompt's cross-attention keys and values
 so a prompt is encoded once however many sessions use it.
 
@@ -21,10 +21,10 @@ from .config import WorldConfig
 from .depth import DepthEstimator
 from .sampler import FlowSchedule
 from .scene import Scene
-from .session import FrameDecoder, Session
+from .session import FrameDecoder, LatentEncoder, Session
 from .types import CrossAttentionCache
 from .utils.hub import component_dir
-from .wan import CausalWanDiT, PromptTokenizer, TaehvDecoder, TextEncoder, UMT5Encoder, WanVAE
+from .wan import CausalWanDiT, PromptTokenizer, Taehv, TextEncoder, UMT5Encoder, WanVAE
 
 logger = logging.getLogger(__name__)
 
@@ -39,11 +39,13 @@ class WorldModel:
         self,
         dit: CausalWanDiT,
         vae: WanVAE,
+        encoder: LatentEncoder,
         decoder: FrameDecoder,
         text_encoder: TextEncoder,
         config: WorldConfig,
     ) -> None:
-        self.dit, self.vae, self.decoder, self.text_encoder = dit, vae, decoder, text_encoder
+        self.dit, self.vae, self.text_encoder = dit, vae, text_encoder
+        self.encoder, self.decoder = encoder, decoder
         self.config = config
         self.device = torch.device(config.device)
         self.schedule = FlowSchedule.warped(config.denoising_steps, config.timestep_shift)
@@ -59,18 +61,18 @@ class WorldModel:
         if config.dit_precision == "fp8":
             _quantize_fp8(dit)
         vae = WanVAE.from_pretrained(folder("vae")).to(device, DTYPE).eval()
-        decoder: FrameDecoder = vae
-        if config.decoder == "taehv":
-            decoder = TaehvDecoder.from_pretrained(folder("taehv")).to(device, DTYPE).eval()
-        encoder = UMT5Encoder.from_pretrained(folder("text_encoder"))
-        encoder = encoder.to(torch.device(config.text_encoder_device), DTYPE).eval()
+        taehv = Taehv.from_pretrained(folder("taehv")).to(device, DTYPE).eval()
+        encoder: LatentEncoder = taehv if config.encoder == "taehv" else vae
+        decoder: FrameDecoder = taehv if config.decoder == "taehv" else vae
+        text_model = UMT5Encoder.from_pretrained(folder("text_encoder"))
+        text_model = text_model.to(torch.device(config.text_encoder_device), DTYPE).eval()
         tokenizer_file = (
             component_dir(config.repo_id, config.revision, "tokenizer") / "tokenizer.json"
         )
         tokenizer = PromptTokenizer(tokenizer_file, TEXT_LENGTH)
-        for module in (dit, vae, decoder, encoder):
+        for module in (dit, vae, taehv, text_model):
             module.requires_grad_(False)
-        world = cls(dit, vae, decoder, TextEncoder(encoder, tokenizer), config)
+        world = cls(dit, vae, encoder, decoder, TextEncoder(text_model, tokenizer), config)
         if config.compile:
             world.compile()
         return world
@@ -103,7 +105,7 @@ class WorldModel:
         """A new generation over `scene` (its own prompt unless `prompt` overrides it)."""
 
         text_kv = self.encode_prompt(scene.prompt if prompt is None else prompt)
-        return Session(scene, self.dit, self.vae, self.decoder, self.schedule, text_kv, seed)
+        return Session(scene, self.dit, self.encoder, self.decoder, self.schedule, text_kv, seed)
 
 
 def load_depth_estimator(config: WorldConfig) -> DepthEstimator:

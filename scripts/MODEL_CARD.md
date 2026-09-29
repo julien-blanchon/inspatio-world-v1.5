@@ -31,7 +31,7 @@ one folder per component, each a `config.json` + `model.safetensors` pair loaded
 | `vae/` | Wan2.1 VAE (causal video autoencoder) | [Wan-AI/Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B) | 127 M | bf16 |
 | `text_encoder/` | umT5-XXL encoder | [Wan-AI/Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B) | 5.7 B | bf16 |
 | `tokenizer/` | umT5 tokenizer (`tokenizer.json`) | [Wan-AI/Wan2.1-T2V-1.3B](https://huggingface.co/Wan-AI/Wan2.1-T2V-1.3B) | — | — |
-| `taehv/` | TAEHV `taew2_1` decoder (fast preview decoder) | [madebyollin/taehv](https://github.com/madebyollin/taehv) | 9.8 M | bf16 |
+| `taehv/` | TAEHV `taew2_1` encoder + decoder (fast stand-ins for the VAE) | [madebyollin/taehv](https://github.com/madebyollin/taehv) | 11.3 M | bf16 |
 | `depth/` | Depth-Anything-3 nested giant-large (depth + cameras) | [depth-anything/DA3NESTED-GIANT-LARGE](https://huggingface.co/depth-anything/DA3NESTED-GIANT-LARGE) | 1.7 B | bf16 / fp32 |
 | `captioner/` | Florence-2-base (video prompts for uploads / examples), transformers format | [florence-community/Florence-2-base](https://huggingface.co/florence-community/Florence-2-base) | 0.23 B | fp32 |
 | `examples/` | Scene folders: the six upstream examples and ten scenes from free [Mixkit](https://mixkit.co) stock footage; `trajectories/`: camera-path presets with previews | [upstream examples](https://github.com/inspatio/inspatio-world-v1.5/tree/main/examples), `scripts/prepare_stock_examples.py` | — | — |

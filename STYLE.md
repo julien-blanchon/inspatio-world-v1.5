@@ -167,7 +167,8 @@ sampler, one scene format, one camera rig. Changing an approach means
 **replacing** it, not adding a selector next to it. A config field must change a _quantity_
 (encode width, window length, windows per batch); the moment a field selects between _code
 paths_, stop and pick one path. The exceptions are **weight choices** behind one shared
-interface, never a branch in the pipeline: `decoder` (`wan` / `taehv`, two `FrameDecoder`s) and
+interface, never a branch in the pipeline: `encoder` / `decoder` (`wan` / `taehv`, two
+`LatentEncoder`s / `FrameDecoder`s) and
 `dit_precision` (`bf16` / `fp8`, the same modules with quantized linear weights).
 
 ### File & module budget
@@ -395,7 +396,7 @@ Project-wide PyTorch idioms for an inference-only library. (Autograd context, de
 
 **Weights**
 
-- Every weight-bearing component (DiT, VAE, TAEHV decoder, umT5 encoder, depth estimator) is a
+- Every weight-bearing component (DiT, VAE, TAEHV, umT5 encoder, depth estimator) is a
   `HubModule` with a `config.json` + `model.safetensors` pair in its own folder of
   `blanchon/inspatio-world-v1.5`; `strict=True` on every load. `world.py` is the only reader.
 

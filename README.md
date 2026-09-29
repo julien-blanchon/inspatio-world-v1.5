@@ -37,7 +37,8 @@ Each block of 3 latents (12 frames at 832x480; the first block is 9 frames):
 
 1. **Render** — the source views are lifted to 3D with their depth and forward-splatted into the
    target cameras (`render/splat.py`), giving a partial RGB render and a coverage mask.
-2. **Encode** — the Wan2.1 VAE encodes the render and the source frames as causal streams.
+2. **Encode** — the Wan2.1 VAE (default) or the TAEHV encoder (`encoder="taehv"`, ~10x cheaper)
+   encodes the render and the source frames as causal streams.
 3. **Denoise** — the causal Wan2.1-1.3B DiT prefills a KV cache from the clean context (source
    block + previous prediction) and denoises the block in 4 flow-matching steps, conditioned on
    the render latents and mask (`wan/dit.py`, `sampler.py`).

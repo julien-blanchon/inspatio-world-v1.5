@@ -10,6 +10,9 @@ WEIGHTS_REPO = "blanchon/inspatio-world-v1.5"
 # TAEHV's distilled decoder (default: ~20x cheaper, slightly softer) or the Wan2.1 VAE decoder
 # the model was trained with (sharpest, ~270 ms per block)
 DecoderKind = Literal["wan", "taehv"]
+# The Wan2.1 VAE encoder the model was trained with (~135 ms per block for the two condition
+# streams, each) or TAEHV's distilled encoder (~13 ms; latents within ~0.07-0.09 std of the VAE's)
+EncoderKind = Literal["wan", "taehv"]
 # DiT linear layers in bf16 as released, or float8 (dynamic per-row activation and weight scales,
 # torchao; the `fp8` extra) on GPUs with fp8 tensor cores (Hopper, Ada, Blackwell)
 DiTPrecision = Literal["bf16", "fp8"]
@@ -23,6 +26,7 @@ class WorldConfig:
     revision: str | None = None
     device: str = "cuda"
     decoder: DecoderKind = "taehv"
+    encoder: EncoderKind = "wan"
     dit_precision: DiTPrecision = "bf16"
     # The 5.7B text encoder only runs once per prompt; "cpu" keeps its 11 GB off the GPU
     text_encoder_device: str = "cuda"

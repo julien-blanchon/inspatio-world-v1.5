@@ -37,8 +37,8 @@ from torch import Tensor, nn
 from inspatio_world.utils.hub import no_init
 from inspatio_world.wan import (
     CausalWanDiT,
+    Taehv,
     TaehvConfig,
-    TaehvDecoder,
     UMT5Config,
     UMT5Encoder,
     WanDiTConfig,
@@ -152,22 +152,22 @@ def text_encoder_state(path: Path) -> StateDict:
 
 
 def taehv_state(path: Path) -> StateDict:
-    """taew2_1: keep the decoder, shift indices past the parameter-free input clamp.
+    """taew2_1: keep the encoder as is, shift decoder indices past the parameter-free clamp.
 
     The first temporal-grow layer is stride 1 at inference; its checkpoint weight holds two
     timesteps' channels and upstream keeps the last one.
     """
 
     state = torch.load(path, map_location="cpu", weights_only=True)
-    decoder = {}
+    converted = {key: value for key, value in state.items() if key.startswith("encoder.")}
     for key, value in state.items():
         match = re.match(r"decoder\.(\d+)\.(.*)", key)
         if match:
-            decoder[f"layers.{int(match[1]) - 1}.{match[2]}"] = value
+            converted[f"decoder.{int(match[1]) - 1}.{match[2]}"] = value
     width = TaehvConfig().widths[0]
-    grow = "layers.6.conv.weight"
-    decoder[grow] = decoder[grow][-width:]
-    return decoder
+    grow = "decoder.6.conv.weight"
+    converted[grow] = converted[grow][-width:]
+    return converted
 
 
 def _save[M: nn.Module](build: Callable[[], M], state: StateDict, folder: Path) -> None:
@@ -197,7 +197,7 @@ def main(config: ConvertConfig) -> None:
     taehv_path.parent.mkdir(exist_ok=True)
     if not taehv_path.exists():
         urllib.request.urlretrieve(TAEHV_URL, taehv_path)
-    _save(lambda: TaehvDecoder(TaehvConfig()), taehv_state(taehv_path), output / "taehv")
+    _save(lambda: Taehv(TaehvConfig()), taehv_state(taehv_path), output / "taehv")
     shutil.rmtree(taehv_path.parent)
 
     # Florence-2-base captions video prompts (demo / example preparation); mirrored unchanged
