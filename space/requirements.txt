@@ -2,5 +2,5 @@ torch==2.13.0
 torchao==0.18.0
 transformers==5.17.0
 simplejpeg
-inspatio-world @ git+https://github.com/julien-blanchon/inspatio-world-v1.5
+inspatio-world @ git+https://github.com/julien-blanchon/inspatio-world-v1.5@99941d1aa7335ca077065c9c423af885c45fd098
 gradio_worldviewer @ https://github.com/julien-blanchon/inspatio-world-v1.5/raw/main/space/wheels/gradio_worldviewer-0.3.1-py3-none-any.whl
