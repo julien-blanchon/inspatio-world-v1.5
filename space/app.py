@@ -2,8 +2,8 @@
 
 Pick a scene (or upload a picture / video: depth and cameras come from Depth-Anything-3, video
 prompts from Florence-2), pick a camera path (your keyboard, or a preset), press Start. The world
-runs a fixed LATENCY_SECONDS behind you: each frame plays the keys you held that long before it
-appears, and the viewer shows what the model conditions on (the point cloud splatted into your
+runs a fixed latency behind you (each frame is shown that long after the moment whose keys it
+plays; see `run_session`), and the viewer shows what the model conditions on (the point cloud splatted into your
 camera), the camera path, and a timeline of your key presses against the frames that play them.
 
 Process layout on ZeroGPU: the Gradio server (main process) receives the viewer's control events
@@ -68,10 +68,12 @@ SESSION_MARGIN_SECONDS = 10  # scene loading, prompt encoding and the eager firs
 SECONDS_ARG = 6  # position of `seconds` in run_session's arguments
 # Playback runs below the ~14 fps the GPU generates, so the viewer's buffer never drains
 PLAYBACK_FPS = 12.0
-# Fixed key-to-screen delay: frame f plays the keys held at t0 + f/fps and is shown at
-# t0 + LATENCY_SECONDS + f/fps. A block (<= 1 s of frames) starts once the keys of its last frame
-# are known and takes ~0.85 s to generate, which leaves ~1.7 s of slack before it is due.
-LATENCY_SECONDS = 3.5
+# Fixed key-to-screen delay: frame f is shown at t0 + latency + f/fps. At >= ~3.2 s every frame
+# plays exactly the keys held at t0 + f/fps; below, blocks start before all their keys are known
+# and the latest keys stand in for the rest of the block.
+LATENCY_SECONDS = 2.5
+LATENCY_RANGE = (1.5, 4.0)
+DELIVERY_MARGIN_SECONDS = 0.35  # transport to the browser plus generation jitter
 MAX_UPLOAD_FRAMES = 180
 RENDER_PREVIEW_STRIDE = 2  # the condition panel shows the render at half resolution
 SCENE_POINTS = 30_000  # sparse point cloud sent to the 3D camera view
@@ -362,10 +364,17 @@ def run_session(
     speed: float,
     seed: int,
     seconds: float,
+    latency: float,
     browser: str,
 ) -> Iterator[dict[str, Any]]:
     """Yield {"scene"} once, then {"frames", "renders", "poses", "actions", ...} per block,
-    then {"ended": reason}."""
+    then {"ended": reason}.
+
+    Frame f is due in the browser at t0 + latency + f/fps and plays the keys held at t0 + f/fps.
+    A block starts as late as possible (all its keys known) but early enough to arrive on time given
+    the measured generation time; frames whose moment is still in the future then take the keys
+    held at the block start.
+    """
 
     folder = Path(scene_path)
     scene = load_scene(folder)
@@ -376,23 +385,26 @@ def run_session(
     path = CameraPath(scene, folder, camera, speed, browser)
     fps = playback_fps(scene.fps)
 
-    clock = time.time()  # t0: frame f plays the keys held at clock + f / fps
+    clock = time.time()  # t0
+    generation = 1.0  # running estimate of a block's generation seconds
     while (reason := _end_reason(session, path, time.time() - clock, seconds)) is None:
         if stop_requested(browser, clock):
             reason = "Stopped"
             break
 
-        # Start the block once the keys of its last frame are known
         first, count = session.frame_index, session.frames_needed
-        sample_times = [clock + (first + i) / fps for i in range(count)]
-        time.sleep(max(0.0, sample_times[-1] - time.time()))
-        poses, actions, seqs = path.next(first, count, sample_times)
+        moments = [clock + (first + i) / fps for i in range(count)]
+        latest_start = clock + latency + first / fps - generation - DELIVERY_MARGIN_SECONDS
+        time.sleep(max(0.0, min(moments[-1], latest_start) - time.time()))
+        now = time.time()
+        poses, actions, seqs = path.next(first, count, [min(m, now) for m in moments])
         block_start = time.perf_counter()
         block = session.step(poses)
         frames = block.frames.cpu().numpy()
         stride = RENDER_PREVIEW_STRIDE
         renders = block.render[:, ::stride, ::stride].cpu().numpy()
         block_seconds = time.perf_counter() - block_start
+        generation = max(block_seconds, 0.8 * generation + 0.2 * block_seconds)
         valid = len(frames)
         yield {
             "frames": frames,
@@ -432,6 +444,7 @@ def start(
     speed: float,
     seed: int,
     seconds: float,
+    latency: float,
     request: gr.Request,
 ) -> Iterator[dict[str, Any]]:
     if not scene_path:
@@ -443,7 +456,9 @@ def start(
     yield {"status": "loading", "message": "Waiting for a GPU…"}
 
     chunk_ids, scene = itertools.count(), None
-    blocks = run_session(scene_path, prompt, quality, camera, speed, int(seed), seconds, browser)
+    blocks = run_session(
+        scene_path, prompt, quality, camera, speed, int(seed), seconds, float(latency), browser
+    )
     try:
         for item in blocks:
             if "scene" in item:
@@ -458,7 +473,7 @@ def start(
                 "fps": fps,
                 "frame_start": item["frame_start"],
                 "elapsed": item["elapsed"],
-                "latency": LATENCY_SECONDS,
+                "latency": float(latency),
                 "frames": _jpeg_uris(item["frames"], quality=85),
                 "renders": _jpeg_uris(item["renders"], quality=75),
                 "poses": item["poses"],
@@ -557,6 +572,13 @@ with gr.Blocks(title="InSpatio-World 1.5") as demo:
         seconds = gr.Slider(
             15, SESSION_SECONDS, value=DEFAULT_SESSION_SECONDS, step=5, label="Session length (s)"
         )
+        latency = gr.Slider(
+            *LATENCY_RANGE,
+            value=LATENCY_SECONDS,
+            step=0.25,
+            label="Latency (s)",
+            info="Delay between your keys and the screen; lower is snappier, higher is smoother",
+        )
         seed = gr.Number(0, label="Seed", precision=0)
 
     gallery.select(select_example, None, [scene_path, poster, prompt])
@@ -564,7 +586,7 @@ with gr.Blocks(title="InSpatio-World 1.5") as demo:
     build.click(build_upload, [images, video, prompt], [scene_path, poster, prompt])
     start_event = viewer.start(
         start,
-        [scene_path, prompt, quality, camera, speed, seed, seconds],
+        [scene_path, prompt, quality, camera, speed, seed, seconds, latency],
         viewer,
         show_progress="hidden",
     )
