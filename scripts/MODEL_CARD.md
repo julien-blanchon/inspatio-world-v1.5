@@ -34,7 +34,7 @@ one folder per component, each a `config.json` + `model.safetensors` pair loaded
 | `taehv/` | TAEHV `taew2_1` decoder (fast preview decoder) | [madebyollin/taehv](https://github.com/madebyollin/taehv) | 9.8 M | bf16 |
 | `depth/` | Depth-Anything-3 nested giant-large (depth + cameras) | [depth-anything/DA3NESTED-GIANT-LARGE](https://huggingface.co/depth-anything/DA3NESTED-GIANT-LARGE) | 1.7 B | bf16 / fp32 |
 | `captioner/` | Florence-2-base (video prompts for uploads / examples), transformers format | [florence-community/Florence-2-base](https://huggingface.co/florence-community/Florence-2-base) | 0.23 B | fp32 |
-| `examples/` | Scene folders: the six upstream examples and nine scenes from the [project page](https://inspatio.github.io/inspatio-world-1.5/); `trajectories/`: camera-path presets with previews | [upstream examples](https://github.com/inspatio/inspatio-world-v1.5/tree/main/examples) | — | — |
+| `examples/` | Scene folders: the six upstream examples and ten scenes from free [Mixkit](https://mixkit.co) stock footage; `trajectories/`: camera-path presets with previews | [upstream examples](https://github.com/inspatio/inspatio-world-v1.5/tree/main/examples), `scripts/prepare_stock_examples.py` | — | — |
 
 The conversion only renames keys (fusing the DiT's q/k/v and cross-attention k/v projections),
 drops unused branches (DA3's ray / Gaussian-splatting heads) and casts to the dtype each module
@@ -72,7 +72,9 @@ Each component keeps its original license:
 - `taehv/`: TAEHV, MIT.
 - `captioner/`: Florence-2, MIT.
 - `depth/`: Depth-Anything-3 DA3NESTED-GIANT-LARGE, **CC BY-NC 4.0 (non-commercial)**.
-- `examples/`: from the upstream repository.
+- `examples/`: the upstream examples come from the upstream repository; the others are frames of
+  [Mixkit](https://mixkit.co) clips under the [Mixkit Stock Video Free License](https://mixkit.co/license/#videoFree),
+  downscaled to 832x480 with estimated depth, for demonstration only.
 
 ## Citation
 

@@ -1,15 +1,16 @@
 """InSpatio-World 1.5 on ZeroGPU: drive a camera through a scene in real time.
 
 Pick a scene (or upload a picture / video: depth and cameras come from Depth-Anything-3, video
-prompts from Florence-2), pick a camera path (your keyboard, or a preset), press Start. Each block
-of 12 frames is generated from the camera path of the previous ~block, so the viewer shows what
-the model conditions on (the point cloud splatted into your camera), the camera path in 3D, and a
-timeline of your key presses against the frames that play them.
+prompts from Florence-2), pick a camera path (your keyboard, or a preset), press Start. The world
+runs a fixed LATENCY_SECONDS behind you: each frame plays the keys you held that long before it
+appears, and the viewer shows what the model conditions on (the point cloud splatted into your
+camera), the camera path, and a timeline of your key presses against the frames that play them.
 
 Process layout on ZeroGPU: the Gradio server (main process) receives the viewer's control events
-and writes the latest camera action to a small file per browser session; the `@spaces.GPU`
-generator runs in a GPU worker process, reads that file before every block, and yields frames
-back. A stop flag file ends the loop early; the session also ends at its time limit.
+and appends them, timestamped, to a small log file per browser session; the `@spaces.GPU`
+generator runs in a GPU worker process, reads the keys held at each frame's time from that log
+before every block, and yields frames back. A stop flag file ends the loop early; the session also
+ends at its time limit.
 """
 
 from __future__ import annotations
@@ -19,6 +20,7 @@ import spaces  # must be imported before torch on ZeroGPU
 # isort: split
 
 import base64
+import bisect
 import itertools
 import json
 import logging
@@ -66,13 +68,15 @@ SESSION_MARGIN_SECONDS = 10  # scene loading, prompt encoding and the eager firs
 SECONDS_ARG = 6  # position of `seconds` in run_session's arguments
 # Playback runs below the ~14 fps the GPU generates, so the viewer's buffer never drains
 PLAYBACK_FPS = 12.0
-PREBUFFER_FRAMES = 8  # ~0.7 s buffered once at start
-MAX_LEAD_SECONDS = 1.0  # generation may run this far ahead of playback before it waits
+# Fixed key-to-screen delay: frame f plays the keys held at t0 + f/fps and is shown at
+# t0 + LATENCY_SECONDS + f/fps. A block (<= 1 s of frames) starts once the keys of its last frame
+# are known and takes ~0.85 s to generate, which leaves ~1.7 s of slack before it is due.
+LATENCY_SECONDS = 3.5
 MAX_UPLOAD_FRAMES = 180
 RENDER_PREVIEW_STRIDE = 2  # the condition panel shows the render at half resolution
 SCENE_POINTS = 30_000  # sparse point cloud sent to the 3D camera view
 POINT_VIEWS = 4  # views of a video sampled for that point cloud
-KEYBOARD, ORIGINAL_PATH = "Keyboard", "Original path"
+KEYBOARD = "Keyboard"
 CAPTION_TASK = "<MORE_DETAILED_CAPTION>"
 STATE_DIR = Path(tempfile.gettempdir()) / "inspatio-sessions"
 STATE_DIR.mkdir(parents=True, exist_ok=True)
@@ -87,8 +91,11 @@ EXAMPLES = (
     else Path(snapshot_download(REPO_ID, allow_patterns=["examples/*"])) / "examples"
 )
 PRESETS_FILE = EXAMPLES / "trajectories" / "presets.json"
+# Camera paths: {"name", "kind": "keyboard" | "trajectory" (the scene's own) | "moves", ...}
 PRESETS: list[dict[str, Any]] = (
-    json.loads(PRESETS_FILE.read_text()) if PRESETS_FILE.exists() else []
+    json.loads(PRESETS_FILE.read_text())
+    if PRESETS_FILE.exists()
+    else [{"name": KEYBOARD, "kind": "keyboard"}]
 )
 
 
@@ -128,15 +135,51 @@ def write_state(browser: str, name: str, value: dict[str, Any]) -> None:
     temporary.replace(path)
 
 
-def read_control(browser: str) -> tuple[CameraAction, int | None]:
-    """The latest camera action of this browser and the sequence number of its control event."""
+class ControlLog:
+    """The browser's control events with their arrival times, read incrementally by the worker."""
 
-    try:
-        data = json.loads(_state_file(browser, "control").read_text())
-    except (OSError, ValueError):
-        return CameraAction(), None
-    action = CameraAction(**{axis: float(data.get(axis, 0.0)) for axis in asdict(CameraAction())})
-    return action, data.get("seq")
+    def __init__(self, browser: str) -> None:
+        self.path = _state_file(browser, "controls")
+        self.offset = 0
+        self.times: list[float] = [float("-inf")]
+        self.events: list[tuple[CameraAction, int | None]] = [(CameraAction(), None)]
+
+    @staticmethod
+    def reset(browser: str) -> None:
+        _state_file(browser, "controls").write_text("")
+
+    @staticmethod
+    def append(browser: str, event: dict[str, Any]) -> None:
+        line = json.dumps({**event, "time": time.time()}) + "\n"
+        # One O_APPEND write per event: concurrent control events never interleave
+        descriptor = os.open(
+            _state_file(browser, "controls"), os.O_WRONLY | os.O_APPEND | os.O_CREAT
+        )
+        try:
+            os.write(descriptor, line.encode())
+        finally:
+            os.close(descriptor)
+
+    def at(self, moment: float) -> tuple[CameraAction, int | None]:
+        """The action held at wall-clock `moment` and the sequence number of its event."""
+
+        self._refresh()
+        return self.events[bisect.bisect_right(self.times, moment) - 1]
+
+    def _refresh(self) -> None:
+        try:
+            with self.path.open("rb") as file:
+                file.seek(self.offset)
+                data = file.read()
+        except OSError:
+            return
+        complete = data[: data.rfind(b"\n") + 1]
+        self.offset += len(complete)
+        for line in complete.decode().splitlines():
+            event = json.loads(line)
+            fields = {axis: float(event.get(axis, 0.0)) for axis in asdict(CameraAction())}
+            self.times.append(float(event["time"]))
+            self.events.append((CameraAction(**fields), event.get("seq")))
 
 
 def stop_requested(browser: str, since: float) -> bool:
@@ -162,7 +205,11 @@ def example_choices() -> list[tuple[str, str]]:
 
 
 def preset_choices() -> list[tuple[str, str]]:
-    return [(str(EXAMPLES / "trajectories" / p["preview"]), p["name"]) for p in PRESETS]
+    return [
+        (str(EXAMPLES / "trajectories" / p["preview"]), p["name"])
+        for p in PRESETS
+        if "preview" in p
+    ]
 
 
 def caption(image: np.ndarray) -> str:
@@ -260,17 +307,18 @@ def scene_info(scene: Scene, title: str) -> dict[str, Any]:
 
 
 class CameraPath:
-    """Per-frame target cameras from the keyboard, a preset script or the scene's original path."""
+    """Per-frame target cameras from the keyboard, a preset script or the scene's original path
+    (scenes without one fall back to the keyboard)."""
 
     def __init__(self, scene: Scene, folder: Path, camera: str, speed: float, browser: str) -> None:
         self.rig = CameraRig(scene, RigConfig(move_speed=RigConfig().move_speed * speed))
-        self.browser = browser
+        self.controls = ControlLog(browser)
         self.trajectory: torch.Tensor | None = None
         self.script: list[CameraAction] | None = None
-        if camera == ORIGINAL_PATH and (folder / "trajectory.txt").exists():
+        preset = next((p for p in PRESETS if p["name"] == camera), {"kind": "keyboard"})
+        if preset["kind"] == "trajectory" and (folder / "trajectory.txt").exists():
             self.trajectory = torch.from_numpy(read_trajectory(folder / "trajectory.txt"))
-        preset = next((p for p in PRESETS if p["name"] == camera), None)
-        if preset is not None:
+        elif preset["kind"] == "moves":
             plan = parse_moves(tuple(preset["moves"]))
             self.script = [action for action, frames in plan for _ in range(frames)]
 
@@ -280,8 +328,11 @@ class CameraPath:
             return len(self.trajectory)
         return len(self.script) if self.script is not None else None
 
-    def next(self, start: int, count: int) -> tuple[torch.Tensor, list[Any], list[int | None]]:
-        """Target world-to-camera poses of frames `start..start+count`, their actions and seqs."""
+    def next(
+        self, start: int, count: int, sample_times: list[float]
+    ) -> tuple[torch.Tensor, list[Any], list[int | None]]:
+        """Target world-to-camera poses of frames `start..start+count`, their actions and seqs;
+        the keyboard is read at each frame's wall-clock `sample_times`."""
 
         if self.trajectory is not None:
             index = torch.arange(start, start + count).clamp(max=len(self.trajectory) - 1)
@@ -290,8 +341,9 @@ class CameraPath:
             actions = [self.script[min(start + i, len(self.script) - 1)] for i in range(count)]
             poses = torch.cat([self.rig.advance(action, 1) for action in actions])
             return poses, [asdict(a) for a in actions], [None] * count
-        action, seq = read_control(self.browser)
-        return self.rig.advance(action, count), [asdict(action)] * count, [seq] * count
+        held = [self.controls.at(moment) for moment in sample_times]
+        poses = torch.cat([self.rig.advance(action, 1) for action, _ in held])
+        return poses, [asdict(action) for action, _ in held], [seq for _, seq in held]
 
 
 # --- the session ---
@@ -324,13 +376,17 @@ def run_session(
     path = CameraPath(scene, folder, camera, speed, browser)
     fps = playback_fps(scene.fps)
 
-    started, started_wall = time.perf_counter(), time.time()
-    while (reason := _end_reason(session, path, time.perf_counter() - started, seconds)) is None:
-        if stop_requested(browser, started_wall):
+    clock = time.time()  # t0: frame f plays the keys held at clock + f / fps
+    while (reason := _end_reason(session, path, time.time() - clock, seconds)) is None:
+        if stop_requested(browser, clock):
             reason = "Stopped"
             break
 
-        poses, actions, seqs = path.next(session.frame_index, session.frames_needed)
+        # Start the block once the keys of its last frame are known
+        first, count = session.frame_index, session.frames_needed
+        sample_times = [clock + (first + i) / fps for i in range(count)]
+        time.sleep(max(0.0, sample_times[-1] - time.time()))
+        poses, actions, seqs = path.next(first, count, sample_times)
         block_start = time.perf_counter()
         block = session.step(poses)
         frames = block.frames.cpu().numpy()
@@ -340,6 +396,8 @@ def run_session(
         valid = len(frames)
         yield {
             "frames": frames,
+            "frame_start": first,
+            "elapsed": time.time() - clock,
             "renders": renders,
             "poses": [np.linalg.inv(p).reshape(-1).tolist() for p in poses[:valid].numpy()],
             "actions": actions[:valid],
@@ -348,15 +406,11 @@ def run_session(
                 "block_ms": round(block_seconds * 1000, 1),
                 "gen_fps": round(valid / block_seconds, 1),
                 "frames": session.frame_index,
-                "elapsed_s": round(time.perf_counter() - started, 1),
+                "elapsed_s": round(time.time() - clock, 1),
                 "limit_s": seconds,
             },
         }
 
-        # Stay at most MAX_LEAD_SECONDS ahead of playback so key presses show up quickly
-        lead = session.frame_index / fps - (time.perf_counter() - started)
-        if lead > MAX_LEAD_SECONDS:
-            time.sleep(lead - MAX_LEAD_SECONDS)
     yield {"ended": reason}
 
 
@@ -384,7 +438,7 @@ def start(
         yield {"status": "error", "message": "Pick a scene first."}
         return
     browser, session_id = request.session_hash or "anonymous", uuid.uuid4().hex[:8]
-    write_state(browser, "control", asdict(CameraAction()))
+    ControlLog.reset(browser)
     fps = playback_fps(load_scene_fps(scene_path))
     yield {"status": "loading", "message": "Waiting for a GPU…"}
 
@@ -402,6 +456,9 @@ def start(
                 "id": next(chunk_ids),
                 "session": session_id,
                 "fps": fps,
+                "frame_start": item["frame_start"],
+                "elapsed": item["elapsed"],
+                "latency": LATENCY_SECONDS,
                 "frames": _jpeg_uris(item["frames"], quality=85),
                 "renders": _jpeg_uris(item["renders"], quality=75),
                 "poses": item["poses"],
@@ -433,7 +490,7 @@ def load_scene_fps(scene_path: str) -> float:
 
 
 def on_control(event: gr.EventData, request: gr.Request) -> None:
-    write_state(request.session_hash or "anonymous", "control", event._data)
+    ControlLog.append(request.session_hash or "anonymous", event._data)
 
 
 def on_stop(request: gr.Request) -> dict[str, Any]:
@@ -454,7 +511,8 @@ TITLE = """
 with gr.Blocks(title="InSpatio-World 1.5") as demo:
     gr.HTML(TITLE)
     scene_path = gr.State(None)
-    viewer = WorldViewer(show_label=False, show_render=True, prebuffer_frames=PREBUFFER_FRAMES)
+    camera = gr.State(KEYBOARD)
+    viewer = WorldViewer(show_label=False, show_render=True, latency=LATENCY_SECONDS)
     with gr.Row():
         with gr.Column(scale=3):
             gallery = gr.Gallery(
@@ -465,18 +523,13 @@ with gr.Blocks(title="InSpatio-World 1.5") as demo:
                 allow_preview=False,
             )
         with gr.Column(scale=2):
-            camera = gr.Dropdown(
-                [KEYBOARD, ORIGINAL_PATH, *(p["name"] for p in PRESETS)],
-                value=KEYBOARD,
-                label="Camera path",
-                info="Keyboard, the example's original path, or a preset (below)",
-            )
             presets = gr.Gallery(
                 value=preset_choices(),
-                label="Camera path presets",
+                label="Camera path",
                 columns=4,
-                height=170,
+                height=230,
                 allow_preview=False,
+                selected_index=0,  # the keyboard
             )
     with gr.Accordion("Scene & prompt", open=False):
         with gr.Row():

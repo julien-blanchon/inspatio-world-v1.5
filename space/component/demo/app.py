@@ -24,8 +24,21 @@ K = [500.0, 500.0, 416.0, 240.0, float(W), float(H)]
 FPS = 15.0
 CHUNK = 12
 N_CHUNKS = 40
+LATENCY = 3.5  # fixed delay: frame f is shown at t0 + LATENCY + f / FPS on the client
 LIMIT_S = 30.0
-AUTOPILOT_CHUNKS = 3  # first blocks drift on autopilot (actions = None)
+AUTOPILOT_CHUNKS = 2  # keyboard mode: first blocks drift on autopilot (actions = None)
+# scripted mode ("preset" trajectory): one action per block, cycled; actions are sent (not None)
+SCRIPT = [
+    {"forward": 1.0},
+    {"forward": 1.0},
+    {"forward": 1.0, "yaw": 1.0},
+    {"yaw": 1.0},
+    {"right": 1.0},
+    {"forward": 1.0, "pitch": 1.0},
+    {"forward": -1.0},
+    {"yaw": -1.0, "up": 1.0},
+]
+AXES = ("forward", "right", "up", "yaw", "pitch")
 
 CONTROLS: dict[str, dict] = {}  # latest control payload per browser session (request.session_hash)
 LOG = os.environ.get("WORLDVIEWER_CONTROL_LOG")
@@ -119,7 +132,7 @@ def fake_frame(pose: np.ndarray, t: float, label: str) -> tuple[np.ndarray, np.n
     return np.asarray(pil), rgb
 
 
-def run(request: gr.Request):
+def run(mode: str, request: gr.Request):
     sh = request.session_hash
     sid = uuid.uuid4().hex[:8]
     yield WorldViewerData(status="loading", message="Warming up the fake model…", scene=SCENE)
@@ -127,13 +140,22 @@ def run(request: gr.Request):
     pose = np.eye(4)
     t_anim = 0.0
     n_frame = 0
-    t0 = time.time()
+    t0 = time.time()  # session clock: frame f's camera is driven by the keys held at t0 + f / FPS
     for i in range(N_CHUNKS):
+        frame_start = i * CHUNK
+        if frame_start / FPS > LIMIT_S:
+            break
+        # wait until this block's sampling time, then read the latest control
+        time.sleep(max(0.0, t0 + frame_start / FPS - time.time()))
         tb = time.time()
         ctrl = dict(CONTROLS.get(sh, {}))
         seq = ctrl.get("seq")
-        autopilot = i < AUTOPILOT_CHUNKS
-        act = None if autopilot else {k: float(ctrl.get(k, 0.0)) for k in ("forward", "right", "up", "yaw", "pitch")}
+        if mode == "Scripted":
+            act = {k: float(SCRIPT[i % len(SCRIPT)].get(k, 0.0)) for k in AXES}
+        elif i < AUTOPILOT_CHUNKS:
+            act = None
+        else:
+            act = {k: float(ctrl.get(k, 0.0)) for k in AXES}
         frames, renders, poses = [], [], []
         for _ in range(CHUNK):
             a = act or {"forward": 0.4, "right": 0.0, "up": 0.0, "yaw": 0.15, "pitch": 0.0}
@@ -161,6 +183,9 @@ def run(request: gr.Request):
                 actions=[act] * CHUNK,
                 control_seqs=[seq] * CHUNK,
                 poses=np.stack(poses),
+                frame_start=frame_start,
+                elapsed=time.time() - t0,
+                latency=LATENCY,
             ),
             stats={
                 "block_ms": round(block_ms, 1),
@@ -170,9 +195,6 @@ def run(request: gr.Request):
                 "limit_s": LIMIT_S,
             },
         )
-        if elapsed > LIMIT_S:
-            break
-        time.sleep(max(0.0, CHUNK / FPS * 0.95 - (time.time() - tb)))  # a bit faster than real time
     yield WorldViewerData(
         status="ended",
         message="Demo finished" if time.time() - t0 <= LIMIT_S else "Session ended: time limit",
@@ -197,7 +219,8 @@ def on_stop():
 with gr.Blocks(title="WorldViewer demo") as demo:
     gr.Markdown("## WorldViewer demo\nFake world model: press **Start**, click the viewer and drive with WASD / arrows.")
     viewer = WorldViewer(label="World", show_label=False)
-    start_evt = viewer.start(run, inputs=None, outputs=viewer, show_progress="hidden")
+    mode = gr.Radio(["Keyboard", "Scripted"], value="Keyboard", label="Camera", elem_id="camera-mode")
+    start_evt = viewer.start(run, inputs=mode, outputs=viewer, show_progress="hidden")
     viewer.stop(on_stop, inputs=None, outputs=viewer, cancels=[start_evt], queue=False, show_progress="hidden")
     viewer.control(on_control, inputs=None, outputs=None, queue=False, show_progress="hidden", trigger_mode="multiple")
 

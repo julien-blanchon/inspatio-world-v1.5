@@ -78,7 +78,7 @@ decoder, and contention-free splatting.
 ```
 src/inspatio_world/   the package (see STYLE.md for conventions)
 scripts/              one-off tools: convert_checkpoints.py (+ convert_depth.py) built the weights
-                      repository, prepare_examples.py the example scenes
+                      repository, prepare_examples.py and prepare_stock_examples.py the example scenes
 space/                the Hugging Face ZeroGPU Space: app.py, aoti.py, the WorldViewer component
 ```
 

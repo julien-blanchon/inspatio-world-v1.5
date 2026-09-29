@@ -54,6 +54,12 @@ class Chunk(GradioModel):
     """Optional per-frame `seq` of the latest control event the backend had received (latency measurement)."""
     poses: Optional[list[list[float]]] = None
     """Optional per-frame camera-to-world 4x4 matrices, row-major 16 floats, OpenCV axes."""
+    frame_start: Optional[int] = None
+    """Fixed-latency playback: session frame index of frames[0]."""
+    elapsed: Optional[float] = None
+    """Fixed-latency playback: seconds since the server's session clock t0 when this chunk was yielded."""
+    latency: Optional[float] = None
+    """Fixed-latency playback: frame f is shown at t0 + latency + f / fps (overrides WorldViewer(latency=...))."""
 
     @field_validator("poses", mode="before")
     @classmethod
@@ -182,11 +188,12 @@ class WorldViewer(Component):
         show_render: bool = True,
         show_camera: bool = True,
         show_timeline: bool = True,
+        latency: float = 3.5,
         prebuffer_frames: int = 8,
         catchup_rate: float = 1.15,
         heartbeat_ms: int = 250,
         max_control_hz: float = 20.0,
-        timeline_seconds: float = 8.0,
+        timeline_seconds: float = 10.0,
         placeholder: str | None = None,
         aspect_ratio: float = 832 / 480,
     ):
@@ -196,8 +203,9 @@ class WorldViewer(Component):
             show_render: whether the "What the model sees" panel (chunk.renders) is initially expanded.
             show_camera: whether the 3D "Camera" panel is initially expanded.
             show_timeline: whether the input/playback timeline is shown.
-            prebuffer_frames: frames to buffer before playback starts (and after a stall).
-            catchup_rate: playback speed multiplier used when more than ~2 chunks are buffered.
+            latency: default fixed delay (s) between the server's session clock and display, used when chunks carry `frame_start`/`elapsed` (a chunk's own `latency` overrides it).
+            prebuffer_frames: legacy jitter buffer only (chunks without `frame_start`/`elapsed`): frames to buffer before playback starts (and after a stall).
+            catchup_rate: legacy jitter buffer only: playback speed multiplier used when more than ~2 chunks are buffered.
             heartbeat_ms: interval of the `control` heartbeat while running/loading.
             max_control_hz: maximum rate of `control` events on action changes.
             timeline_seconds: visible window of the timeline.
@@ -207,6 +215,7 @@ class WorldViewer(Component):
         self.show_render = show_render
         self.show_camera = show_camera
         self.show_timeline = show_timeline
+        self.latency = latency
         self.prebuffer_frames = prebuffer_frames
         self.catchup_rate = catchup_rate
         self.heartbeat_ms = heartbeat_ms

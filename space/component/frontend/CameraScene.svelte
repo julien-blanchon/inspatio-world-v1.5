@@ -1,5 +1,7 @@
 <script lang="ts">
-	// Scene graph of the "Camera" panel: point cloud, source frustums, generated camera path.
+	// Scene graph of the "Camera" panel: a faint point cloud, source frustums, and the generated camera
+	// path drawn with thick lines (played = solid, buffered = faded; dots per frame, bigger dots per block;
+	// a single frustum for the current camera).
 	// The player writes into a plain mutable `store` at up to 60 Hz; a threlte task polls its version
 	// counters and only invalidates (re-renders on demand) when something changed.
 	import { T, useTask, useThrelte } from "@threlte/core";
@@ -7,10 +9,17 @@
 	import {
 		BufferAttribute,
 		BufferGeometry,
-		DynamicDrawUsage,
+		CanvasTexture,
 		Float32BufferAttribute,
+		Points,
+		PointsMaterial,
 		type PerspectiveCamera
 	} from "three";
+	import { Line2 } from "three/examples/jsm/lines/Line2.js";
+	import { LineGeometry } from "three/examples/jsm/lines/LineGeometry.js";
+	import { LineMaterial } from "three/examples/jsm/lines/LineMaterial.js";
+	import { LineSegments2 } from "three/examples/jsm/lines/LineSegments2.js";
+	import { LineSegmentsGeometry } from "three/examples/jsm/lines/LineSegmentsGeometry.js";
 	import { untrack } from "svelte";
 	import type { CamStore } from "./types";
 
@@ -28,7 +37,7 @@
 		empty?: boolean;
 	} = $props();
 
-	const { invalidate, dpr } = useThrelte();
+	const { invalidate, dpr, size } = useThrelte();
 
 	let cam: PerspectiveCamera | undefined = $state.raw();
 	let controls: any = $state.raw();
@@ -36,18 +45,63 @@
 	let points_geom: BufferGeometry | null = $state.raw(null);
 	let src_frustums: BufferGeometry | null = $state.raw(null);
 	let src_path: BufferGeometry | null = $state.raw(null);
-	let played_geom: BufferGeometry = $state.raw(new BufferGeometry());
-	let buf_geom: BufferGeometry = $state.raw(new BufferGeometry());
-	const cur_geom = new BufferGeometry();
-	const marks_geom = new BufferGeometry();
-	let cur_visible = $state(false);
 
-	let path_cap = 0;
-	let path_attr: BufferAttribute | null = null;
+	// thick lines (screen-space width in CSS px); objects are created once, geometries swapped
+	const mat_played = new LineMaterial({ color: accent, linewidth: 3, worldUnits: false });
+	const mat_buf = new LineMaterial({ color: accent, linewidth: 2.5, transparent: true, opacity: 0.3, depthWrite: false });
+	const mat_cur = new LineMaterial({ color: "#ffd2a8", linewidth: 2.5 });
+	const played_line = new Line2(new LineGeometry(), mat_played);
+	const buf_line = new Line2(new LineGeometry(), mat_buf);
+	const cur_frustum = new LineSegments2(new LineSegmentsGeometry(), mat_cur);
+	for (const o of [played_line, buf_line, cur_frustum]) {
+		o.frustumCulled = false;
+		o.visible = false;
+	}
+	cur_frustum.renderOrder = 4;
+	played_line.renderOrder = 2;
+
+	// position markers along the path: round screen-space dots per frame, bigger ones per block start
+	function disc_texture(): CanvasTexture | null {
+		if (typeof document === "undefined") return null;
+		const c = document.createElement("canvas");
+		c.width = c.height = 64;
+		const g = c.getContext("2d")!;
+		g.fillStyle = "#fff";
+		g.beginPath();
+		g.arc(32, 32, 28, 0, Math.PI * 2);
+		g.fill();
+		return new CanvasTexture(c);
+	}
+	const disc = disc_texture();
+	const dot_mat = (px: number, opacity: number) =>
+		new PointsMaterial({
+			color: accent,
+			size: px * dpr.current,
+			sizeAttenuation: false,
+			map: disc,
+			alphaTest: 0.5,
+			transparent: opacity < 1,
+			opacity,
+			depthWrite: opacity >= 1
+		});
+	const played_dots = new Points(new BufferGeometry(), dot_mat(5, 1));
+	const buf_dots = new Points(new BufferGeometry(), dot_mat(5, 0.3));
+	const played_blk = new Points(new BufferGeometry(), dot_mat(10, 1));
+	const buf_blk = new Points(new BufferGeometry(), dot_mat(10, 0.3));
+	for (const o of [played_dots, buf_dots, played_blk, buf_blk]) {
+		o.frustumCulled = false;
+		o.renderOrder = 3;
+	}
+
+	$effect(() => {
+		const s = $size;
+		for (const m of [mat_played, mat_buf, mat_cur]) m.resolution.set(s.width, s.height);
+		invalidate();
+	});
+
 	let seen_scene = -1;
 	let seen_path = -1;
-	let radius = 1;
-	let center = [0, 0, 0];
+	let depth = 1; // typical scene depth in front of the source camera (sets frustum sizes / framing)
 	let K = [500, 500, 416, 240, 832, 480];
 	let framed_by_path = false;
 
@@ -62,13 +116,13 @@
 		const c = i / 255;
 		return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
 	});
-	function cam_center(p: number[]): [number, number, number] {
-		return [p[3], p[7], p[11]];
-	}
-	function to_three(v: number[]): number[] {
-		// the world group is rotated 180 deg about x: OpenCV (x, y, z) -> three (x, -y, -z)
-		return [v[0], -v[1], -v[2]];
-	}
+	type V3 = [number, number, number];
+	const cam_center = (p: number[]): V3 => [p[3], p[7], p[11]];
+	const col = (p: number[], k: number): V3 => [p[k], p[4 + k], p[8 + k]]; // rotation column k
+	const add = (a: V3, b: V3, s = 1): V3 => [a[0] + b[0] * s, a[1] + b[1] * s, a[2] + b[2] * s];
+	// the world group is rotated 180 deg about x: OpenCV (x, y, z) -> three (x, -y, -z)
+	const to_three = (v: V3): V3 => [v[0], -v[1], -v[2]];
+
 	/** Line-segment vertices of a camera frustum at depth d (OpenCV world coords). */
 	function frustum_verts(p: number[], d: number, out: number[]): void {
 		const [fx, fy, cx, cy, w, h] = K;
@@ -100,50 +154,84 @@
 		g.setAttribute("position", new Float32BufferAttribute(verts, 3));
 		return g;
 	}
-
-	function robust_bounds(xyz: Float32Array, extra: number[][]): void {
-		const n = xyz.length / 3;
-		const step = Math.max(1, Math.floor(n / 6000));
-		const ax: number[][] = [[], [], []];
-		for (let i = 0; i < n; i += step)
-			for (let k = 0; k < 3; k++) {
-				const v = xyz[i * 3 + k];
-				if (Number.isFinite(v)) ax[k].push(v);
-			}
-		for (const e of extra) for (let k = 0; k < 3; k++) ax[k].push(e[k]);
-		const lo: number[] = [],
-			hi: number[] = [];
-		for (let k = 0; k < 3; k++) {
-			const a = ax[k].sort((x, y) => x - y);
-			lo.push(a.length ? a[Math.floor(a.length * 0.03)] : -1);
-			hi.push(a.length ? a[Math.min(a.length - 1, Math.floor(a.length * 0.97))] : 1);
+	function swap_line(obj: Line2, pts: number[]): void {
+		const old = obj.geometry;
+		if (pts.length >= 6) {
+			const g = new LineGeometry();
+			g.setPositions(pts);
+			obj.geometry = g;
+			obj.visible = true;
+		} else {
+			obj.geometry = new LineGeometry();
+			obj.visible = false;
 		}
-		center = [0, 1, 2].map((k) => (lo[k] + hi[k]) / 2);
-		radius = Math.max(1e-3, 0.5 * Math.hypot(hi[0] - lo[0], hi[1] - lo[1], hi[2] - lo[2]));
+		old.dispose();
+	}
+	function swap_points(obj: Points, verts: number[]): void {
+		const old = obj.geometry;
+		obj.geometry = geom_from(verts);
+		obj.visible = verts.length >= 3;
+		old.dispose();
+	}
+	function swap_segments(obj: LineSegments2, verts: number[]): void {
+		const old = obj.geometry;
+		const g = new LineSegmentsGeometry();
+		if (verts.length >= 6) g.setPositions(verts);
+		obj.geometry = g;
+		obj.visible = verts.length >= 6;
+		old.dispose();
 	}
 
+	/** Median depth of the points in front of camera p (sampled). */
+	function median_depth(xyz: Float32Array, p: number[]): number {
+		const n = xyz.length / 3;
+		if (!n) return 1;
+		const c = cam_center(p),
+			f = col(p, 2);
+		const step = Math.max(1, Math.floor(n / 5000));
+		const zs: number[] = [];
+		for (let i = 0; i < n; i += step) {
+			const z = (xyz[i * 3] - c[0]) * f[0] + (xyz[i * 3 + 1] - c[1]) * f[1] + (xyz[i * 3 + 2] - c[2]) * f[2];
+			if (z > 0 && Number.isFinite(z)) zs.push(z);
+		}
+		if (!zs.length) return 1;
+		zs.sort((a, b) => a - b);
+		return Math.max(1e-3, zs[Math.floor(zs.length / 2)]);
+	}
+
+	/**
+	 * 3/4 elevated view from behind/above the source (or first path) camera, looking at the region
+	 * just in front of it, so forward motion and turns read clearly. Frames the path if it has
+	 * already wandered further than that region.
+	 */
 	function frame_view(): void {
 		if (!cam || !controls) return;
-		const src = store.scene?.source_poses?.[0] ?? store.poses[0] ?? null;
-		const c3 = to_three(center);
-		let eye: number[];
-		if (src) {
-			// behind and above the (first) source camera, looking at the scene centre
-			const sc = to_three(cam_center(src));
-			const fwd = to_three([src[2], src[6], src[10]]);
-			eye = [
-				sc[0] - fwd[0] * radius * 0.9,
-				sc[1] - fwd[1] * radius * 0.9 + radius * 0.75,
-				sc[2] - fwd[2] * radius * 0.9
-			];
+		const ref = store.scene?.source_poses?.[0] ?? store.poses[0] ?? null;
+		let target: V3, eye: V3;
+		if (ref) {
+			const c = cam_center(ref);
+			const right = col(ref, 0),
+				down = col(ref, 1),
+				fwd = col(ref, 2);
+			let reach = depth * 0.35;
+			for (const p of store.poses) {
+				const q = cam_center(p);
+				reach = Math.max(reach, Math.hypot(q[0] - c[0], q[1] - c[1], q[2] - c[2]) * 0.6);
+			}
+			target = add(c, fwd, Math.min(reach, depth * 0.6));
+			const r = Math.max(reach, depth * 0.35);
+			eye = add(add(add(target, fwd, -2.0 * r), down, -1.3 * r), right, 0.9 * r);
 		} else {
-			eye = [c3[0] + radius, c3[1] + radius, c3[2] + radius * 1.5];
+			target = [0, 0, 0];
+			eye = [1.5, -1.5, -2.5];
 		}
-		cam.position.set(eye[0], eye[1], eye[2]);
-		cam.near = radius / 200;
-		cam.far = radius * 60;
+		const t3 = to_three(target),
+			e3 = to_three(eye);
+		cam.position.set(e3[0], e3[1], e3[2]);
+		cam.near = depth / 500;
+		cam.far = depth * 100;
 		cam.updateProjectionMatrix();
-		controls.target.set(c3[0], c3[1], c3[2]);
+		controls.target.set(t3[0], t3[1], t3[2]);
 		controls.update();
 		invalidate();
 	}
@@ -173,11 +261,11 @@
 			console.warn("[WorldViewer] bad scene points", e);
 		}
 		const sp = s.source_poses ?? [];
-		robust_bounds(xyz, sp.map(cam_center));
+		depth = sp.length ? median_depth(xyz, sp[0]) : 1;
 		const verts: number[] = [];
 		const every = sp.length > 12 ? 12 : 1;
 		sp.forEach((p, i) => {
-			if (i % every === 0 || i === sp.length - 1) frustum_verts(p, radius * 0.12, verts);
+			if (i % every === 0 || i === sp.length - 1) frustum_verts(p, depth * 0.12, verts);
 		});
 		if (verts.length) src_frustums = geom_from(verts);
 		if (sp.length > 1) src_path = geom_from(sp.flatMap(cam_center));
@@ -185,53 +273,28 @@
 		frame_view();
 	}
 
-	function ensure_path_capacity(n: number): void {
-		if (n <= path_cap && path_attr) return;
-		path_cap = Math.max(1024, 2 ** Math.ceil(Math.log2(Math.max(1, n))));
-		path_attr = new BufferAttribute(new Float32Array(path_cap * 3), 3);
-		path_attr.setUsage(DynamicDrawUsage);
-		played_geom.dispose();
-		buf_geom.dispose();
-		const a = new BufferGeometry();
-		a.setAttribute("position", path_attr);
-		const b = new BufferGeometry();
-		b.setAttribute("position", path_attr); // both lines share one attribute, split by draw range
-		played_geom = a;
-		buf_geom = b;
-	}
-
 	function update_path(): void {
 		const poses = store.poses;
 		const n = poses.length;
-		ensure_path_capacity(n);
-		const arr = path_attr!.array as Float32Array;
-		for (let i = 0; i < n; i++) {
-			const p = poses[i];
-			arr[i * 3] = p[3];
-			arr[i * 3 + 1] = p[7];
-			arr[i * 3 + 2] = p[11];
-		}
-		path_attr!.needsUpdate = true;
 		const played = Math.min(store.played, n);
-		played_geom.setDrawRange(0, played);
-		const b0 = Math.max(0, played - 1);
-		buf_geom.setDrawRange(b0, n - b0);
+		const pts = poses.flatMap(cam_center);
+		swap_line(played_line, pts.slice(0, played * 3));
+		swap_line(buf_line, pts.slice(Math.max(0, played - 1) * 3));
 
 		const cur = played > 0 ? poses[played - 1] : null;
-		cur_visible = !!cur;
-		if (cur) {
-			const v: number[] = [];
-			frustum_verts(cur, radius * 0.1, v);
-			cur_geom.setAttribute("position", new Float32BufferAttribute(v, 3));
-		}
-		// faint frustum at the start of each 12-frame block of the path
-		const fv: number[] = [];
-		for (let i = 0; i < n; i += 12) if (i !== played - 1) frustum_verts(poses[i], radius * 0.05, fv);
-		marks_geom.setAttribute("position", new Float32BufferAttribute(fv, 3));
+		const cv: number[] = [];
+		if (cur) frustum_verts(cur, depth * 0.1, cv);
+		swap_segments(cur_frustum, cv);
+		// dots: every frame, and bigger ones at block starts (every 12 frames); played solid, buffered faded
+		swap_points(played_dots, pts.slice(0, played * 3));
+		swap_points(buf_dots, pts.slice(played * 3));
+		const pb: number[] = [],
+			bb: number[] = [];
+		for (let i = 0; i < n; i += 12) (i < played ? pb : bb).push(...cam_center(poses[i]));
+		swap_points(played_blk, pb);
+		swap_points(buf_blk, bb);
 
 		if (!store.scene && n > 0 && !framed_by_path) {
-			robust_bounds(new Float32Array(0), poses.map(cam_center));
-			radius = Math.max(radius, 1);
 			framed_by_path = true;
 			frame_view();
 		}
@@ -279,37 +342,36 @@
 
 <T.Group rotation.x={Math.PI}>
 	{#if points_geom}
-		<T.Points>
+		<!-- faint cloud so the camera path and frustums stand out -->
+		<T.Points renderOrder={0}>
 			<T is={points_geom} />
-			<T.PointsMaterial size={1.7 * dpr.current} sizeAttenuation={false} vertexColors />
+			<T.PointsMaterial
+				size={1.2 * dpr.current}
+				sizeAttenuation={false}
+				vertexColors
+				transparent
+				opacity={0.3}
+				depthWrite={false}
+			/>
 		</T.Points>
 	{/if}
 	{#if src_frustums}
 		<T.LineSegments>
 			<T is={src_frustums} />
-			<T.LineBasicMaterial color="#9ca3af" transparent opacity={0.8} />
+			<T.LineBasicMaterial color="#cbd5e1" transparent opacity={0.9} />
 		</T.LineSegments>
 	{/if}
 	{#if src_path}
 		<T.Line>
 			<T is={src_path} />
-			<T.LineBasicMaterial color="#9ca3af" transparent opacity={0.6} />
+			<T.LineBasicMaterial color="#cbd5e1" transparent opacity={0.6} />
 		</T.Line>
 	{/if}
-	<T.Line frustumCulled={false}>
-		<T is={played_geom} />
-		<T.LineBasicMaterial color={accent} />
-	</T.Line>
-	<T.Line frustumCulled={false}>
-		<T is={buf_geom} />
-		<T.LineBasicMaterial color={accent} transparent opacity={0.3} />
-	</T.Line>
-	<T.LineSegments frustumCulled={false}>
-		<T is={marks_geom} />
-		<T.LineBasicMaterial color={accent} transparent opacity={0.35} />
-	</T.LineSegments>
-	<T.LineSegments visible={cur_visible} frustumCulled={false}>
-		<T is={cur_geom} />
-		<T.LineBasicMaterial color={accent} />
-	</T.LineSegments>
+	<T is={buf_line} />
+	<T is={played_line} />
+	<T is={buf_dots} />
+	<T is={buf_blk} />
+	<T is={played_dots} />
+	<T is={played_blk} />
+	<T is={cur_frustum} />
 </T.Group>

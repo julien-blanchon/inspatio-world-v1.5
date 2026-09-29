@@ -19,6 +19,10 @@ export interface Chunk {
 	actions?: (Partial<Action> | null)[] | null;
 	control_seqs?: (number | null)[] | null;
 	poses?: number[][] | null;
+	// fixed-latency scheduling (optional; without them the viewer falls back to a jitter buffer)
+	frame_start?: number | null; // session frame index of frames[0]
+	elapsed?: number | null; // seconds since the server's session clock t0 when the chunk was yielded
+	latency?: number | null; // seconds: frame f is due at t0 + latency + f / fps
 }
 
 export interface SceneInfo {
@@ -49,6 +53,7 @@ export interface WorldViewerProps {
 	show_camera: boolean;
 	show_timeline: boolean;
 	prebuffer_frames: number;
+	latency: number;
 	catchup_rate: number;
 	heartbeat_ms: number;
 	max_control_hz: number;
@@ -87,25 +92,44 @@ export interface Frame {
 	pose: number[] | null;
 	chunk_id: number;
 	first_in_chunk: boolean;
+	index: number | null; // session frame index (scheduled mode)
+	arrived: number; // performance.now() when decoded and queued
 }
 
 export type Axis = "forward" | "right" | "yaw" | "pitch" | "up";
 
-/** A timeline bar: axis value held from t0 to t1 (ms, performance.now clock); t1 null = still open. */
+/** A key-press bar: axis value held from t0 to t1 (ms, performance.now clock); t1 null = still held. */
 export interface Seg {
-	axis: Axis | "auto";
+	axis: Axis;
 	val: number;
 	t0: number;
 	t1: number | null;
 }
 
+/** A frame as the timeline needs it (displayed or still buffered). */
+export interface TlFrame {
+	action: Action | null;
+	has_action: boolean;
+	fps: number;
+	first_in_chunk: boolean;
+	index: number | null; // session frame index (scheduled mode)
+}
+
+/** A displayed frame: shown at time t (performance.now) for dur ms. */
+export interface PlayedFrame extends TlFrame {
+	t: number;
+	dur: number;
+}
+
 /** Shared mutable timeline store (written by the player/controls, read by the Timeline rAF loop). */
 export interface TimelineStore {
-	you: Seg[];
-	played: Seg[];
-	ticks: number[]; // control events sent
-	blocks: number[]; // block boundary display times
-	latency_ms: number | null;
+	you: Seg[]; // key presses
+	frames: PlayedFrame[]; // frames actually displayed
+	queue: TlFrame[]; // buffered frames, in play order (same array the player consumes)
+	latency_ms: number | null; // smoothed measured key -> display lag (null until measured)
+	session: number; // bumped when a new session starts (clears the view)
+	/** Fixed-latency schedule: frame f was sampled at base0 + f*1000/fps and is shown delay_ms later. */
+	sched: { base0: number; fps: number; delay_ms: number } | null;
 }
 
 /** Shared mutable store written by the player; polled by CameraView in rAF (no Svelte reactivity at 15-60 Hz). */

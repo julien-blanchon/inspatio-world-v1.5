@@ -3,6 +3,7 @@
 	import { Block } from "@gradio/atoms";
 	import { onDestroy, onMount, untrack } from "svelte";
 	import Timeline from "./Timeline.svelte";
+	import MapView from "./MapView.svelte";
 	import type {
 		Action,
 		Axis,
@@ -30,7 +31,8 @@
 	const catchup = $derived(gradio.props.catchup_rate ?? 1.15);
 	const heartbeat_ms = $derived(gradio.props.heartbeat_ms ?? 250);
 	const min_ctrl_interval = $derived(1000 / Math.max(1, gradio.props.max_control_hz ?? 20));
-	const timeline_seconds = $derived(gradio.props.timeline_seconds ?? 8);
+	const timeline_seconds = $derived(gradio.props.timeline_seconds ?? 10);
+	const default_latency_ms = $derived(1000 * (gradio.props.latency ?? 3.5));
 	const show_timeline = $derived(gradio.props.show_timeline ?? true);
 	const placeholder_text = $derived(
 		gradio.props.placeholder ?? "Press Start, then click here and use WASD / arrows to move"
@@ -42,8 +44,14 @@
 	let canvas: HTMLCanvasElement | undefined = $state();
 	let cond: HTMLCanvasElement | undefined = $state();
 	let cam_reset = $state(0);
-	// three.js + threlte are code-split and only fetched when the component mounts
-	const camera_view = import("./CameraView.svelte");
+	// Camera panel: 2D top-down map by default; the three.js/threlte 3D view is code-split and only
+	// fetched the first time "3D" is selected
+	let cam_mode: "map" | "3d" = $state("map");
+	let camera_view: Promise<typeof import("./CameraView.svelte")> | null = $state(null);
+	function set_cam_mode(m: "map" | "3d"): void {
+		cam_mode = m;
+		if (m === "3d" && !camera_view) camera_view = import("./CameraView.svelte");
+	}
 
 	let pending: "start" | "stop" | null = $state(null);
 	let focused = $state(false);
@@ -55,7 +63,9 @@
 	let buffering = $state(false);
 	let buffered = $state(0);
 	let play_fps = $state(0);
-	let latency = $state<number | null>(null);
+	let latency = $state<number | null>(null); // measured key -> display lag (ms)
+	let delay = $state<number | null>(null); // scheduled delay (s), scheduled mode only
+	let first_in = $state<number | null>(null); // seconds until the first frame is due
 	let aspect = $state(untrack(() => gradio.props.aspect_ratio || 832 / 480));
 	let now = $state(performance.now());
 	let stats_at = $state(performance.now());
@@ -106,7 +116,7 @@
 	}
 
 	// ----------------------------------------------------- shared stores
-	const tl: TimelineStore = { you: [], played: [], ticks: [], blocks: [], latency_ms: null };
+	const tl: TimelineStore = { you: [], frames: [], queue: [], latency_ms: null, session: 0, sched: null };
 	const cam: CamStore = { scene: null, scene_version: 0, poses: [], played: 0, version: 0 };
 	let scene_key = "";
 
@@ -128,7 +138,15 @@
 	let ui_last = 0;
 	let latency_ema: number | null = null;
 	const sent_at = new Map<number, number>();
-	let played_open: Seg[] = [];
+	// fixed-latency schedule (set from the first chunk carrying `elapsed`): frame f is due at
+	// base0 + lat_ms + shift + f * 1000 / sched_fps; `shift` only grows when a frame arrives late
+	let base0: number | null = null;
+	let lat_ms = 3500;
+	let shift = 0;
+	let sched_fps = 15;
+	let last_index = -1;
+	let drawn_this_session = false;
+	let stopped_session: string | null = null;
 
 	function close_frame(f: Frame | null): void {
 		if (!f) return;
@@ -140,6 +158,7 @@
 		gen++;
 		for (const f of queue) close_frame(f);
 		queue = [];
+		tl.queue = queue;
 		seen = new Set();
 		max_seen = -1;
 		cur_session = session;
@@ -150,7 +169,11 @@
 		latency_ema = null;
 		tl.latency_ms = null;
 		latency = null;
-		close_played(performance.now());
+		base0 = null;
+		shift = 0;
+		last_index = -1;
+		drawn_this_session = false;
+		tl.sched = null;
 		cam.poses = [];
 		cam.played = 0;
 		cam.version++;
@@ -190,6 +213,7 @@
 	function enqueue_chunk(c: Chunk): void {
 		const my_gen = gen;
 		const fps = c.fps > 0 ? c.fps : 15;
+		const start = typeof c.frame_start === "number" ? c.frame_start : null;
 		const frames_p = Promise.all(c.frames.map(decode));
 		const renders_p = c.renders?.length
 			? Promise.all(c.renders.map((r) => decode(r).catch(() => null)))
@@ -226,6 +250,8 @@
 					pose: pose ?? null,
 					chunk_id: c.id,
 					first_in_chunk: i === 0,
+					index: start != null ? start + i : null,
+					arrived: performance.now(),
 					pose_index
 				};
 			});
@@ -256,11 +282,21 @@
 		set_scene(v);
 		const c = v.chunk;
 		if (!c || !Array.isArray(c.frames) || c.frames.length === 0) return;
+		if (c.session === stopped_session) return; // chunks still in flight after Stop
 		if (c.session !== cur_session) reset_player(c.session);
 		else if (c.id === 0 && max_seen > 0) reset_player(c.session);
 		else if (seen.has(c.id)) return; // repeated value update (e.g. final re-send)
 		seen.add(c.id);
 		max_seen = Math.max(max_seen, c.id);
+		if (base0 == null && typeof c.elapsed === "number" && typeof c.frame_start === "number") {
+			// client estimate of the server's session clock t0 (network delay only adds latency)
+			base0 = performance.now() - c.elapsed * 1000;
+			sched_fps = c.fps > 0 ? c.fps : 15;
+		}
+		if (base0 != null) {
+			lat_ms = 1000 * (typeof c.latency === "number" ? c.latency : default_latency_ms / 1000);
+			tl.sched = { base0, fps: sched_fps, delay_ms: lat_ms + shift };
+		}
 		enqueue_chunk(c);
 	}
 
@@ -269,35 +305,27 @@
 		untrack(() => on_value(v));
 	});
 
-	// ------------------------------------------------ played timeline lane
-	function close_played(t: number): void {
-		for (const s of played_open) if (s.t1 == null || s.t1 > t) s.t1 = t;
-		played_open = [];
+	// ------------------------------------------------------ timeline data
+	function record_played(f: QFrame, t: number): void {
+		tl.frames.push({
+			t,
+			dur: 1000 / (f.fps || 15),
+			action: f.action,
+			has_action: f.has_action,
+			fps: f.fps,
+			first_in_chunk: f.first_in_chunk,
+			index: f.index
+		});
 	}
 
-	function record_played(f: QFrame, t: number): void {
-		const dur = 1000 / (f.fps || 15);
-		const end = t + dur;
-		if (f.first_in_chunk) tl.blocks.push(t);
-		const want: { axis: Axis | "auto"; val: number }[] = [];
-		if (f.has_action && !f.action) want.push({ axis: "auto", val: 1 });
-		else if (f.action) for (const ax of AXES) if (f.action[ax] !== 0) want.push({ axis: ax, val: f.action[ax] });
-		const next: Seg[] = [];
-		for (const w of want) {
-			const open = played_open.find(
-				(s) => s.axis === w.axis && s.val === w.val && s.t1 != null && s.t1 >= t - dur * 1.5
-			);
-			if (open) {
-				open.t1 = end;
-				next.push(open);
-			} else {
-				const s: Seg = { axis: w.axis, val: w.val, t0: t, t1: end };
-				tl.played.push(s);
-				next.push(s);
-			}
-		}
-		for (const s of played_open) if (!next.includes(s) && s.t1 != null && s.t1 > t) s.t1 = t;
-		played_open = next;
+	/** New session: clear the timeline (keys still held restart at the current time). */
+	function clear_timeline(): void {
+		tl.you.length = 0;
+		tl.frames.length = 0;
+		tl.latency_ms = null;
+		tl.session++;
+		for (const ax of AXES) delete you_open[ax];
+		record_you(axes(held));
 	}
 
 	// ------------------------------------------------------------ drawing
@@ -353,6 +381,70 @@
 		last_t = t;
 		const streaming = server_status === "running" || server_status === "loading";
 
+		if (base0 != null && (queue.length === 0 || queue[0].index != null)) {
+			tick_scheduled(t, streaming);
+		} else {
+			tick_jitter(t, dt, streaming);
+		}
+
+		if (t - ui_last > 120) {
+			ui_last = t;
+			let b: boolean;
+			if (base0 != null) {
+				const next_due = base0 + lat_ms + shift + ((last_index + 1) * 1000) / sched_fps;
+				b = streaming && drawn_this_session && queue.length === 0 && t > next_due + 30;
+				const fi = !drawn_this_session && streaming ? Math.max(0, (next_due - t) / 1000) : null;
+				if (fi !== first_in && (fi == null || first_in == null || Math.abs(fi - first_in) > 0.05)) first_in = fi;
+				const d = (lat_ms + shift) / 1000;
+				if (d !== delay) delay = d;
+			} else {
+				b = streaming && !playing && has_frame;
+				if (first_in != null) first_in = null;
+				if (delay != null) delay = null;
+			}
+			if (b !== buffering) buffering = b;
+			if (buffered !== queue.length) buffered = queue.length;
+			let fps = 0;
+			if (drawn_times.length > 2 && t - drawn_times[drawn_times.length - 1] < 1000) {
+				fps = ((drawn_times.length - 1) * 1000) / (drawn_times[drawn_times.length - 1] - drawn_times[0]);
+			}
+			if (Math.abs(fps - play_fps) > 0.05) play_fps = fps;
+			const l = latency_ema;
+			if (l !== latency && (l == null || latency == null || Math.abs(l - latency) > 15)) latency = l;
+			now = performance.now();
+			for (const [s, ts] of sent_at) if (t - ts > 60000) sent_at.delete(s);
+		}
+	}
+
+	/** Fixed-latency playback: show frame f exactly at its due time; wait if early, stall if late. */
+	function tick_scheduled(t: number, streaming: boolean): void {
+		const due = (f: QFrame) => base0! + lat_ms + shift + (f.index! * 1000) / (f.fps || sched_fps);
+		// catch up (e.g. after a background tab paused rAF): drop frames that were on time but missed
+		while (queue.length > 1 && due(queue[1]) <= t && queue[1].arrived <= due(queue[1])) {
+			const d = queue.shift()!;
+			record_played(d, due(d));
+			if (d.pose_index >= 0) cam.played = d.pose_index + 1;
+			close_frame(d);
+		}
+		const head = queue[0];
+		if (!head || t < due(head)) return;
+		const late = t - due(head);
+		if (head.arrived > due(head) && late > 0) {
+			// stall: the frame came after its due time -> move the schedule forward by the stall
+			shift += late;
+			if (tl.sched) tl.sched.delay_ms = lat_ms + shift;
+		}
+		queue.shift();
+		playing = true;
+		drawn_this_session = true;
+		last_index = head.index!;
+		draw(head, t);
+		drawn_times.push(t);
+		if (drawn_times.length > 30) drawn_times.shift();
+	}
+
+	/** Legacy playback (chunks without frame_start/elapsed): jitter buffer + catch-up rate. */
+	function tick_jitter(t: number, dt: number, streaming: boolean): void {
 		if (!playing) {
 			if (queue.length >= prebuffer || (queue.length > 0 && !streaming)) {
 				playing = true;
@@ -362,7 +454,6 @@
 		if (playing) {
 			if (queue.length === 0) {
 				playing = false;
-				close_played(t);
 			} else {
 				const n = queue.length;
 				const rate = n > 4 * chunk_len ? catchup * catchup : n > 2 * chunk_len ? catchup : 1;
@@ -375,22 +466,6 @@
 					if (drawn_times.length > 30) drawn_times.shift();
 				}
 			}
-		}
-
-		if (t - ui_last > 120) {
-			ui_last = t;
-			const b = streaming && !playing && has_frame;
-			if (b !== buffering) buffering = b;
-			if (buffered !== queue.length) buffered = queue.length;
-			let fps = 0;
-			if (drawn_times.length > 2 && t - drawn_times[drawn_times.length - 1] < 1000) {
-				fps = ((drawn_times.length - 1) * 1000) / (drawn_times[drawn_times.length - 1] - drawn_times[0]);
-			}
-			if (Math.abs(fps - play_fps) > 0.05) play_fps = fps;
-			const l = latency_ema;
-			if (l !== latency && (l == null || latency == null || Math.abs(l - latency) > 15)) latency = l;
-			now = performance.now();
-			for (const [s, ts] of sent_at) if (t - ts > 60000) sent_at.delete(s);
 		}
 	}
 
@@ -469,7 +544,6 @@
 		last_sent_at = t;
 		const payload: ControlPayload = { ...a, seq: ++seq, session: cur_session ?? "" };
 		sent_at.set(payload.seq, t);
-		tl.ticks.push(t);
 		gradio.dispatch("control", payload);
 	}
 
@@ -491,12 +565,20 @@
 		if (!can_start) return;
 		pending = "start";
 		stats_at = performance.now();
+		stopped_session = null;
+		clear_timeline();
 		gradio.dispatch("start", {});
 		stage?.focus({ preventScroll: true });
 	}
 	function do_stop(): void {
 		if (!can_stop) return;
 		pending = "stop";
+		// Stop clears immediately: drop buffered frames and ignore chunks still in flight
+		stopped_session = cur_session;
+		gen++;
+		for (const f of queue) close_frame(f);
+		queue.length = 0;
+		buffered = 0;
 		gradio.dispatch("stop", {});
 	}
 
@@ -564,12 +646,9 @@
 		close_frame(current);
 	});
 
-	const TIP_COND =
-		"The render condition: the scene's point cloud (from depth) splatted into the camera you are steering, for the frame being played. Black holes are regions no source pixel covers — the model has to imagine them.";
-	const TIP_CAM =
-		"3D view of the scene point cloud (in the source camera's world frame), the source camera(s) in grey, and the generated camera path: solid = already played, faint = generated but still buffered, highlighted frustum = current frame. Drag to orbit, scroll to zoom.";
-	const TIP_TL =
-		"You: your key presses as they happen (ticks = control events sent). Played: the camera action baked into each frame when it is displayed. Generation runs in blocks of frames, so the Played lane is the You lane shifted right by the end-to-end latency.";
+	const TIP_COND = "Your scene's point cloud seen from your camera; black holes are what the model imagines.";
+	const TIP_CAM = "Top-down map of your camera path from the start (dashed: not played yet); switch to 3D to orbit.";
+	const TIP_TL = "Your keys (right cursor) reach the screen at the model cursor, one latency later.";
 </script>
 
 {#snippet info(tip: string, side: "left" | "right")}
@@ -622,7 +701,8 @@
 							<span><span class="k">play</span> {play_fps.toFixed(1)}</span>
 							{#if gen_fps != null}<span><span class="k">gen</span> {gen_fps.toFixed(1)} fps</span>{/if}
 							<span><span class="k">buf</span> {buffered}</span>
-							{#if latency != null}<span class="lat"><span class="k">latency</span> {(latency / 1000).toFixed(2)} s</span>{/if}
+							{#if delay != null}<span class="lat"><span class="k">delay</span> {delay.toFixed(2)} s</span>{/if}
+							{#if latency != null}<span class={delay != null ? "" : "lat"}><span class="k">{delay != null ? "lag" : "latency"}</span> {(latency / 1000).toFixed(2)} s</span>{/if}
 						</div>
 					</div>
 
@@ -672,6 +752,9 @@
 
 					{#if buffering && status === "running"}
 						<div class="chip buffering glass"><span class="mini-spin"></span>buffering</div>
+					{/if}
+					{#if first_in != null && status === "running"}
+						<div class="chip buffering glass"><span class="mini-spin"></span>first frame in {first_in.toFixed(1)} s</div>
 					{/if}
 					{#if status === "running" && !focused}
 						<div class="chip hint glass">Click here to control</div>
@@ -733,22 +816,31 @@
 						{#if scene_title}<span class="sub" title={scene_title}>{scene_title}</span>{/if}
 						<span class="grow"></span>
 						{#if cam_open}
-							<button class="mini" onclick={() => cam_reset++} title="Re-frame the scene">Reset view</button>
+							<div class="seg" role="group" aria-label="Camera view">
+								<button class:on={cam_mode === "map"} aria-pressed={cam_mode === "map"} onclick={() => set_cam_mode("map")} data-testid="worldviewer-cam-map">Map</button>
+								<button class:on={cam_mode === "3d"} aria-pressed={cam_mode === "3d"} onclick={() => set_cam_mode("3d")} data-testid="worldviewer-cam-3d">3D</button>
+							</div>
+							<button class="mini" onclick={() => cam_reset++} title="Re-frame the view">Reset view</button>
 						{/if}
 						<button class="mini" onclick={() => (cam_open = !cam_open)} aria-pressed={cam_open}>
 							{cam_open ? "Hide" : "Show"}
 						</button>
 					</header>
 					<div class="panel-body cam-body" class:hidden={!cam_open}>
-						{#await camera_view then m}
-							<m.default store={cam} visible={cam_open} reset={cam_reset} />
-						{:catch}
-							<div class="empty">3D view unavailable</div>
-						{/await}
+						{#if cam_mode === "map"}
+							<MapView store={cam} visible={cam_open} reset={cam_reset} />
+						{:else if camera_view}
+							{#await camera_view then m}
+								<m.default store={cam} visible={cam_open} reset={cam_reset} />
+							{:catch}
+								<div class="empty">3D view unavailable</div>
+							{/await}
+						{/if}
 						<div class="cam-legend">
-							<span><i class="sw src"></i>source</span>
+							<span><i class="mk start"></i>start</span>
 							<span><i class="sw played"></i>played</span>
-							<span><i class="sw buf"></i>buffered</span>
+							<span><i class="sw buf"></i>upcoming</span>
+							<span><i class="mk cur"></i>camera</span>
 						</div>
 					</div>
 				</section>
@@ -760,11 +852,11 @@
 				<header>
 					<span class="title">Timeline</span>
 					{@render info(TIP_TL, "left")}
-					<span class="sub">your input vs. what is on screen</span>
+					<span class="sub">your keys vs. what is on screen</span>
 					<span class="grow"></span>
-					{#if latency != null}<span class="lat-badge mono">latency {(latency / 1000).toFixed(2)} s</span>{/if}
+					{#if latency != null}<span class="lat-badge mono" title="Measured time from a control event to the frame generated with it">measured lag {(latency / 1000).toFixed(2)} s</span>{/if}
 				</header>
-				<Timeline store={tl} seconds={timeline_seconds} />
+				<Timeline store={tl} seconds={timeline_seconds} running={status === "running"} />
 			</section>
 		{/if}
 	</div>
@@ -772,7 +864,7 @@
 
 <style>
 	.wv {
-		--wv-radius: 14px;
+		--wv-radius: var(--block-radius, 14px);
 		--wv-accent: var(--color-accent, #f97316);
 		--wv-glass: rgba(14, 16, 22, 0.55);
 		--wv-glass-border: rgba(255, 255, 255, 0.12);
@@ -789,9 +881,14 @@
 		width: 100%;
 		box-sizing: border-box;
 		color: var(--body-text-color);
+		/* clip everything (incl. blurred / transformed layers) to the block's rounded frame */
+		border-radius: var(--block-radius, 14px);
+		overflow: hidden;
+		isolation: isolate;
 	}
 	.wv.fullscreen {
 		background: #07080b;
+		border-radius: 0;
 		height: 100vh;
 		overflow: auto;
 		padding: 14px;
@@ -835,6 +932,11 @@
 		aspect-ratio: var(--ar);
 		border-radius: var(--wv-radius);
 		overflow: hidden;
+		isolation: isolate;
+		/* backdrop-filter / transformed children can escape a rounded overflow clip in Chromium;
+		   clip-path + paint containment keep every layer inside the rounded box */
+		clip-path: inset(0 round var(--wv-radius));
+		contain: paint;
 		background: radial-gradient(120% 120% at 50% 0%, #1b1f2a 0%, #0b0d12 60%, #06070a 100%);
 		outline: none;
 		box-shadow:
@@ -857,6 +959,7 @@
 		width: 100%;
 		height: 100%;
 		object-fit: contain;
+		border-radius: inherit;
 	}
 	.hidden {
 		display: none !important;
@@ -864,6 +967,8 @@
 	.poster {
 		position: absolute;
 		inset: 0;
+		overflow: hidden; /* the grid below is scaled/transformed: keep it inside */
+		border-radius: inherit;
 	}
 	.poster-grid {
 		position: absolute;
@@ -970,6 +1075,8 @@
 		left: 0;
 		right: 0;
 		bottom: 0;
+		border-radius: 0 0 var(--wv-radius) var(--wv-radius);
+		overflow: hidden;
 		height: 3px;
 		background: rgba(255, 255, 255, 0.1);
 		z-index: 3;
@@ -1008,6 +1115,7 @@
 	.overlay {
 		position: absolute;
 		inset: 0;
+		border-radius: inherit;
 		z-index: 2;
 		display: flex;
 		flex-direction: column;
@@ -1271,6 +1379,7 @@
 		aspect-ratio: var(--ar);
 		border-radius: 8px;
 		overflow: hidden;
+		isolation: isolate;
 		background: #000;
 	}
 	.cond {
@@ -1307,6 +1416,8 @@
 		padding: 0;
 		border-radius: 0 0 12px 12px;
 		overflow: hidden;
+		isolation: isolate;
+		clip-path: inset(0 round 0 0 12px 12px);
 		background: radial-gradient(100% 100% at 50% 30%, #161a23 0%, #0b0d12 100%);
 	}
 	.cam-legend {
@@ -1330,17 +1441,47 @@
 	.sw {
 		display: inline-block;
 		width: 12px;
-		height: 2px;
+		height: 3px;
 	}
-	.sw.src {
-		background: #9ca3af;
+	.mk {
+		display: inline-block;
+		width: 8px;
+		height: 8px;
+		border-radius: 50%;
+		box-sizing: border-box;
+	}
+	.mk.start {
+		border: 2px solid #f4f5f7;
+	}
+	.mk.cur {
+		background: var(--wv-accent);
+		border: 1.5px solid #fff;
+	}
+	.seg {
+		display: inline-flex;
+		border: 1px solid rgba(255, 255, 255, 0.12);
+		border-radius: 6px;
+		overflow: hidden;
+	}
+	.seg button {
+		height: 22px;
+		padding: 0 8px;
+		font-size: 10.5px;
+		color: rgba(244, 245, 247, 0.7);
+		background: transparent;
+		border: none;
+		cursor: pointer;
+	}
+	.seg button.on {
+		background: rgba(249, 115, 22, 0.22);
+		color: #fff;
 	}
 	.sw.played {
 		background: var(--wv-accent);
 	}
 	.sw.buf {
-		background: var(--wv-accent);
-		opacity: 0.35;
+		background: repeating-linear-gradient(90deg, var(--wv-accent) 0 4px, transparent 4px 7px);
+		opacity: 0.5;
 	}
 	.tl-panel {
 		padding-bottom: 8px;

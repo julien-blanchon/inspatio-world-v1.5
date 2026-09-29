@@ -8,7 +8,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "gradio_worldviewer"
-version = "0.2.0"
+version = "0.3.1"
 description = "Real-time keyboard/touch-controlled chunk-streaming viewer for camera-controllable video world models (Gradio custom component)"
 readme = "README.md"
 license = "Apache-2.0"
